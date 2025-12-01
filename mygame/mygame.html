@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html>
+
+<body>
+  <div id="pageHeader" style="padding:8px;">
+    <h1 style="margin:0; font-size:1.2rem;">Pirate's life — Group ID: 8821</h1>
+    <!-- Link to Full version -->
+    <button id="toFullBtn" style="margin-left:12px; padding:6px 10px; font-size:0.9rem; cursor:pointer;" onclick="window.location.href='mygamefull.html'">Full version</button>
+  </div>
+  <div id="div1"></div>
+  <div id="onScreenButtons" style="position:fixed; right:8px; bottom:8px; z-index:10;"></div>
+  <script type="importmap">
+      {
+          "imports": {
+          "three": "../libs/Three/build/three.module.js"
+          }
+      }
+  </script>
+  <script src="mygame.js" type="module" defer></script>
+</body>
+
+</html>
