@@ -2,7 +2,6 @@
 
 import * as T from "../libs/Three/build/three.module.js";
 import { OrbitControls } from "../libs/Three/examples/jsm/controls/OrbitControls.js";
-import { MTLLoader } from "../libs/Three/examples/jsm/loaders/MTLLoader.js";
 import { OBJLoader } from "../libs/Three/examples/jsm/loaders/OBJLoader.js";
 
 // spin!
@@ -10,12 +9,34 @@ import { OBJLoader } from "../libs/Three/examples/jsm/loaders/OBJLoader.js";
 // create the window that we want to draw into - this will
 // create a Canvas element - we'll set it to be
 let renderer = new T.WebGLRenderer();
-renderer.setSize(800, 800);
+renderer.setSize(600, 600);
 // Prevent mobile browsers from turning touch drags into page scrolling so
 // OrbitControls receives touch events reliably.
 try { renderer.domElement.style.touchAction = "none"; } catch (e) {}
 // put the canvas into the DOM
 document.getElementById("div1").appendChild(renderer.domElement);
+
+// simple loading overlay helpers
+function showLoadingOverlay(msg) {
+  try {
+    let ov = document.getElementById('loadingOverlay');
+    if (!ov) {
+      ov = document.createElement('div');
+      ov.id = 'loadingOverlay';
+      ov.style.position = 'fixed';
+      ov.style.left = '0'; ov.style.top = '0'; ov.style.right = '0'; ov.style.bottom = '0';
+      ov.style.display = 'flex'; ov.style.alignItems = 'center'; ov.style.justifyContent = 'center';
+      ov.style.background = 'rgba(0,0,0,0.6)'; ov.style.color = '#fff'; ov.style.zIndex = '9999';
+      ov.style.fontSize = '20px';
+      document.body.appendChild(ov);
+    }
+    ov.textContent = msg || 'Loading...';
+    ov.style.visibility = 'visible';
+  } catch (e) {}
+}
+function hideLoadingOverlay() {
+  try { const ov = document.getElementById('loadingOverlay'); if (ov) ov.style.visibility = 'hidden'; } catch (e) {}
+}
 
 // make a "scene" - a world to put the box into
 let scene = new T.Scene();
@@ -44,6 +65,15 @@ let inputState = { forward: false, back: false, left: false, right: false, jump:
 // fish system
 let fishes = [];
 let fishGroup = null;
+// splash particles for entering water
+let splashGroup = null;
+let splashParticles = []; // { mesh, vel }
+// dynamic cube camera for water reflections
+let dynamicCubeCamera = null;
+let cubeCamAcc = 0;
+const CUBE_CAM_UPDATE_INTERVAL = 0.8; // seconds between updates
+// procedural star reflection texture for water (canvas texture)
+// (star reflection / debug plane removed)
 // --- Collectibles & HUD ---
 let collectibles = [];
 let collectiblesGroup = null;
@@ -72,6 +102,10 @@ let PIRATE_SPAWN_INTERVAL = 3.0; // seconds between spawn attempts (base)
 let pirateSpawnAcc = 0;
 // make pirates noticeably faster
 const PIRATE_SPEED = 2.4;
+// player's baseline horizontal speed (used by player movement and for pirate caps)
+const PLAYER_SPEED = 3.0;
+// how long (seconds) it takes a pirate to grow from base speed to the cap
+const PIRATE_GROW_TIME = 200.0;
   // adaptive spawn tuning
   let pirateKillCount = 0;
   const PIRATE_KILLS_FOR_STEP = 10;
@@ -79,8 +113,375 @@ const PIRATE_SPEED = 2.4;
   const MIN_PIRATE_SPAWN_INTERVAL = 0.6; // floor
 // small global attraction weight so all pirates bias toward the player (0=no attract, 1=strong)
 const PIRATE_ATTRACT_WEIGHT = 0.6;
-const PIRATE_MAX = 2400;
+const PIRATE_MAX = 15;
 const PIRATE_ATTACK_RADIUS = 0.9; // how close pirate must get to hit player
+
+// Optional full-mode hat model (loaded from ./models/PirateHat.obj)
+let pirateHatModel = null;
+// Optional full-mode treasure chest model (MTL + OBJ + PNG)
+let treasureChestModel = null;
+// Optional full-mode alien head model (MTL + OBJ + PNG)
+let alienHeadModel = null;
+// Optional full-mode cutlass model (MTL + OBJ + PNG)
+let cutlassModel = null;
+// optional face textures for pirates in Full mode
+let pirateBackTexture = null;
+let pirateChestTexture = null;
+// Promises used to wait for model loading in Full mode
+let pirateHatPromise = Promise.resolve();
+let treasureChestPromise = Promise.resolve();
+let alienHeadPromise = Promise.resolve();
+let cutlassPromise = Promise.resolve();
+try {
+  if (typeof window !== 'undefined' && (window.__USE_TEXTURE_ATLAS__ || window.__FORCE_FULL__)) {
+    try {
+      // create a promise that resolves when the pirate hat model finishes loading (or fails)
+      pirateHatPromise = new Promise((resolve) => {
+        const _objL = new OBJLoader();
+        _objL.load('./models/PirateHat.obj', (o) => {
+        try {
+          pirateHatModel = o;
+          // ensure materials are standard-like so lighting looks correct
+          pirateHatModel.traverse((c) => {
+            if (c.isMesh && c.material) {
+              // keep existing material but enable vertex normals if missing
+              try { c.material.flatShading = false; c.material.needsUpdate = true; } catch (e) {}
+            }
+          });
+          console.log('[mygame] PirateHat model loaded');
+          // replace procedural hats on any already-spawned pirates
+          try {
+            if (pirates && pirates.length > 0) {
+              for (let i = 0; i < pirates.length; ++i) {
+                const p = pirates[i];
+                try {
+                  const head = p && p.mesh && p.mesh.head;
+                  if (!head) continue;
+                  // remove procedural hat children
+                  for (let ci = head.children.length - 1; ci >= 0; --ci) {
+                    const ch = head.children[ci];
+                    try {
+                      if (ch && ch.userData && ch.userData.isProceduralHat) {
+                        head.remove(ch);
+                        try { disposeObject(ch); } catch (e) {}
+                      }
+                    } catch (e) {}
+                  }
+                  // attach cloned hat model (nudge up and forward so it doesn't cover face)
+                  const hatClone = pirateHatModel.clone(true);
+                  // compute hat color from pirate behavior so cloned OBJ matches procedural hats
+                  try {
+                    let hatColor = 0xcc0000;
+                    const beh = p && (p.behavior || (p.mesh && p.mesh.userData && p.mesh.userData.behavior));
+                    if (beh === 'align') hatColor = 0x00aa00;
+                    else if (beh === 'separate') hatColor = 0xaa55ff;
+                    else if (beh === 'cohere') hatColor = 0xffff55;
+                    // recolor any mesh materials on the hat clone to match
+                    // Clone materials per-mesh so hat instances don't share materials
+                    hatClone.traverse((c) => {
+                      if (c && c.isMesh && c.material) {
+                        try {
+                          if (Array.isArray(c.material)) {
+                            // replace with cloned material instances
+                            c.material = c.material.map(m => m.clone());
+                            c.material.forEach(m => { try { m.color && m.color.set(hatColor); } catch (e) {} });
+                          } else {
+                            c.material = c.material.clone();
+                            try { if (c.material.color) c.material.color.set(hatColor); } catch (e) {}
+                          }
+                        } catch (e) {}
+                      }
+                    });
+                  } catch (e) {}
+                  // estimate head height via bounding box and raise hat +0.1 higher than before
+                  try {
+                    const bb = new T.Box3().setFromObject(head);
+                    const hh = (bb.max.y - bb.min.y) || 0.4;
+                    hatClone.position.set(0, hh / 2 + 0.24, 0.12);
+                  } catch (e) {
+                    hatClone.position.set(0, 0.48, 0.12);
+                  }
+                  hatClone.scale.set(0.5, 0.5, 0.5);
+                  hatClone.rotation.set(0, 0, -0.08);
+        head.add(hatClone);
+                  // add a small disk to cover any circular hole at the top of the OBJ
+                  try {
+                    hatClone.updateMatrixWorld(true);
+                    const _bb = new T.Box3().setFromObject(hatClone);
+                    const topCenterWorld = new T.Vector3((_bb.min.x + _bb.max.x) * 0.5, _bb.max.y + 0.001, (_bb.min.z + _bb.max.z) * 0.5);
+                    const topCenterLocal = hatClone.worldToLocal(topCenterWorld.clone());
+                    const maxSpan = Math.max(_bb.max.x - _bb.min.x, _bb.max.z - _bb.min.z);
+                    const diskRadius = Math.max(0.02, maxSpan * 0.5 * 0.9);
+                    const diskGeo = new T.CircleGeometry(diskRadius, 24);
+                    const diskMat = new T.MeshStandardMaterial({ color: hatColor, metalness: 0.05, roughness: 0.6 });
+                    const disk = new T.Mesh(diskGeo, diskMat);
+                    // orient disk horizontal (normal +Y)
+                    disk.rotation.set(-Math.PI / 2, 0, 0);
+                    disk.position.copy(topCenterLocal);
+                    disk.userData = disk.userData || {};
+                    disk.userData.isHatFill = true;
+                    hatClone.add(disk);
+                  } catch (e) {}
+                } catch (e) {}
+              }
+            }
+          } catch (e) {}
+          // If the player exists and is using the Full-mode alien head, attach a black pirate hat to the player too
+          try {
+            if (player && player.mesh && player.mesh.head) {
+              try {
+                const phead = player.mesh.head;
+                // remove any previous player hat we added earlier
+                for (let ci = phead.children.length - 1; ci >= 0; --ci) {
+                  const ch = phead.children[ci];
+                  try { if (ch && ch.userData && ch.userData.isPlayerHat) { phead.remove(ch); disposeObject(ch); } } catch (e) {}
+                }
+                const playerHat = pirateHatModel.clone(true);
+                // recolor to black specifically for player hat
+                playerHat.traverse((c) => {
+                  if (c && c.isMesh && c.material) {
+                    try {
+                      if (Array.isArray(c.material)) {
+                        c.material = c.material.map(m => m.clone());
+                        c.material.forEach(m => { try { m.color && m.color.set(0x000000); } catch (e) {} });
+                      } else {
+                        c.material = c.material.clone();
+                        try { if (c.material.color) c.material.color.set(0x000000); } catch (e) {}
+                      }
+                    } catch (e) {}
+                  }
+                });
+                // estimate head height and place hat relative to player's head
+                try {
+                  const bbp = new T.Box3().setFromObject(phead);
+                  const hhp = (bbp.max.y - bbp.min.y) || 0.4;
+                  playerHat.position.set(0, hhp / 2 + 0.24, 0.12);
+                } catch (e) { playerHat.position.set(0, 0.48, 0.12); }
+                playerHat.scale.set(0.5, 0.5, 0.5);
+                playerHat.rotation.set(0, 0, -0.08);
+                playerHat.userData = playerHat.userData || {}; playerHat.userData.isPlayerHat = true;
+                phead.add(playerHat);
+                // add small disk fill to match pirate hats
+                try {
+                  // Ensure the scene/world matrices are up to date so the bounding box is correct
+                  try { if (typeof scene !== 'undefined' && scene && typeof scene.updateMatrixWorld === 'function') scene.updateMatrixWorld(true); } catch (e) { try { playerHat.updateMatrixWorld(true); } catch (e) {} }
+                  const _bbp = new T.Box3().setFromObject(playerHat);
+                  const topCenterWorldP = new T.Vector3((_bbp.min.x + _bbp.max.x) * 0.5, _bbp.max.y + 0.001, (_bbp.min.z + _bbp.max.z) * 0.5);
+                  const topCenterLocalP = playerHat.worldToLocal(topCenterWorldP.clone());
+                  const maxSpanP = Math.max(_bbp.max.x - _bbp.min.x, _bbp.max.z - _bbp.min.z);
+                  // adjust disk radius multiplier per user tweaks (0.75)
+                  const diskRadiusP = Math.max(0.02, maxSpanP * 0.5 * 0.75);
+                  const diskGeoP = new T.CircleGeometry(diskRadiusP, 24);
+                  const diskMatP = new T.MeshStandardMaterial({ color: 0x000000, metalness: 0.05, roughness: 0.6 });
+                  const diskP = new T.Mesh(diskGeoP, diskMatP);
+                  diskP.rotation.set(-Math.PI / 2, 0, 0);
+                  diskP.position.copy(topCenterLocalP);
+                  // apply cumulative nudge: total downward -0.8 and backward -0.25 (moved up 0.1)
+                  try { diskP.position.y -= 0.8; diskP.position.z -= 0.25; } catch (e) {}
+                  diskP.userData = diskP.userData || {};
+                  diskP.userData.isHatFill = true;
+                  playerHat.add(diskP);
+                } catch (e) {}
+              } catch (e) {}
+            }
+          } catch (e) {}
+        } catch (e) { console.warn('pirate hat model setup failed', e); }
+        finally {
+          // resolve the pirateHatPromise on success or after any setup errors
+          try { resolve(); } catch (e) {}
+        }
+        }, undefined, (err) => { console.warn('Failed to load PirateHat.obj', err); try { resolve(); } catch (e) {} });
+      });
+    } catch (e) { console.warn('OBJLoader not available to load PirateHat.obj', e); }
+  }
+} catch (e) {}
+
+// load TreasureChest (MTL + OBJ) dynamically to avoid static type-only import issues
+try {
+  if (typeof window !== 'undefined' && (window.__USE_TEXTURE_ATLAS__ || window.__FORCE_FULL__)) {
+    treasureChestPromise = new Promise((resolve) => {
+      import('../libs/Three/examples/jsm/loaders/MTLLoader.js').then((mod) => {
+        try {
+          const MTLLoader = mod.MTLLoader;
+          const mtlPath = './models/TreasureChest/Treasure_Chest_1203224535_texture.mtl';
+          const objPath = './models/TreasureChest/Treasure_Chest_1203224535_texture.obj';
+          const mloader = new MTLLoader();
+          mloader.load(mtlPath, (materials) => {
+            try {
+              materials.preload();
+              const objL = new OBJLoader();
+              objL.setMaterials(materials);
+              objL.load(objPath, (o) => {
+                try {
+                  treasureChestModel = o;
+                  treasureChestModel.traverse((c) => {
+                    if (c.isMesh && c.material) {
+                      try { c.material.needsUpdate = true; } catch (e) {}
+                    }
+                  });
+                  console.log('[mygame] TreasureChest model loaded');
+                } catch (e) { console.warn('TreasureChest load callback error', e); }
+                resolve();
+              }, undefined, (err) => { console.warn('Failed to load TreasureChest.obj', err); resolve(); });
+            } catch (e) { console.warn('Error preparing TreasureChest materials', e); resolve(); }
+          }, undefined, (err) => { console.warn('Failed to load TreasureChest.mtl', err); resolve(); });
+        } catch (e) { console.warn('Error during dynamic MTLLoader usage', e); resolve(); }
+      }).catch((e) => { console.warn('Failed to import MTLLoader dynamically', e); resolve(); });
+    });
+  }
+} catch (e) {}
+
+// load Alien head model (MTL + OBJ + PNG) for Full mode
+try {
+  if (typeof window !== 'undefined' && (window.__USE_TEXTURE_ATLAS__ || window.__FORCE_FULL__)) {
+    alienHeadPromise = new Promise((resolve) => {
+      import('../libs/Three/examples/jsm/loaders/MTLLoader.js').then((mod) => {
+        try {
+          const MTLLoader = mod.MTLLoader;
+          const mtlPath = './models/Alien_Head_texture_obj/Gray_Alien_Head_1204002109_texture.mtl';
+          const objPath = './models/Alien_Head_texture_obj/Gray_Alien_Head_1204002109_texture.obj';
+          const mloader = new MTLLoader();
+          mloader.load(mtlPath, (materials) => {
+            try {
+              materials.preload();
+              const objL = new OBJLoader();
+              objL.setMaterials(materials);
+              objL.load(objPath, (o) => {
+                try {
+                  alienHeadModel = o;
+                  alienHeadModel.traverse((c) => { if (c.isMesh && c.material) try { c.material.needsUpdate = true; } catch (e) {} });
+                  console.log('[mygame] Alien head model loaded');
+                  // If the player was already created before the model finished loading,
+                  // replace the player's head with the alien model so Full mode shows the model.
+                  try {
+                    if (player && player.mesh && player.mesh.head) {
+                      try {
+                        // remove existing head children
+                        const oldHead = player.mesh.head;
+                        for (let ci = oldHead.children.length - 1; ci >= 0; --ci) {
+                          const ch = oldHead.children[ci];
+                          try { oldHead.remove(ch); disposeObject(ch); } catch (e) {}
+                        }
+                        // attach cloned alien model
+                        const clone = alienHeadModel.clone(true);
+                        clone.traverse((c) => { try { if (c && c.isMesh) { c.userData = c.userData || {}; c.userData.isAlienHead = true; } } catch (e) {} });
+                        // scale/align roughly to player's head
+                        try {
+                          const bb = new T.Box3().setFromObject(clone);
+                          const size = new T.Vector3(); bb.getSize(size);
+                          const targetY = (oldHead.geometry && oldHead.geometry.parameters && oldHead.geometry.parameters.height) ? oldHead.geometry.parameters.height : 0.4;
+                          const sx = targetY / (size.y || targetY);
+                          const sxw = ((oldHead.geometry && oldHead.geometry.parameters && oldHead.geometry.parameters.width) ? oldHead.geometry.parameters.width : 0.44) / (size.x || 0.44);
+                          const sxd = ((oldHead.geometry && oldHead.geometry.parameters && oldHead.geometry.parameters.depth) ? oldHead.geometry.parameters.depth : 0.44) / (size.z || 0.44);
+                          const s = Math.min(sx, sxw, sxd) * 0.95;
+                          // scale the alien head to 1.9x the original target size
+                          clone.scale.set(s * 1.9, s * 1.9, s * 1.9);
+                                          const bb2 = new T.Box3().setFromObject(clone);
+                                          clone.position.y -= bb2.min.y;
+                                          // nudge the alien head forward and down for a better fit on the player
+                                          try { clone.position.z += 0.092; clone.position.y -= 0.4; } catch (e) {}
+                        } catch (e) {}
+                        const headGroup = new T.Group(); headGroup.add(clone);
+                        headGroup.position.copy(oldHead.position || new T.Vector3());
+                        // replace head reference
+                        try { player.mesh.remove(oldHead); } catch (e) {}
+                        player.mesh.add(headGroup);
+                        player.mesh.head = headGroup;
+                        // If the pirate hat model is already loaded, attach a black pirate hat to the player's alien head
+                        try {
+                          if (pirateHatModel) {
+                            try {
+                              const phead = player.mesh.head;
+                              // remove any previous player hat
+                              for (let ci = phead.children.length - 1; ci >= 0; --ci) {
+                                const ch = phead.children[ci];
+                                try { if (ch && ch.userData && ch.userData.isPlayerHat) { phead.remove(ch); disposeObject(ch); } } catch (e) {}
+                              }
+                              const playerHat = pirateHatModel.clone(true);
+                              playerHat.traverse((c) => {
+                                if (c && c.isMesh && c.material) {
+                                  try {
+                                    if (Array.isArray(c.material)) {
+                                      c.material = c.material.map(m => m.clone());
+                                      c.material.forEach(m => { try { m.color && m.color.set(0x000000); } catch (e) {} });
+                                    } else {
+                                      c.material = c.material.clone();
+                                      try { if (c.material.color) c.material.color.set(0x000000); } catch (e) {}
+                                    }
+                                  } catch (e) {}
+                                }
+                              });
+                              try { const bbp = new T.Box3().setFromObject(phead); const hhp = (bbp.max.y - bbp.min.y) || 0.4; playerHat.position.set(0, hhp / 2 + 0.24, 0.12); } catch (e) { playerHat.position.set(0, 0.48, 0.12); }
+                              playerHat.scale.set(0.5, 0.5, 0.5);
+                              playerHat.rotation.set(0, 0, -0.08);
+                              playerHat.userData = playerHat.userData || {}; playerHat.userData.isPlayerHat = true;
+                              phead.add(playerHat);
+                              try {
+                                playerHat.updateMatrixWorld(true);
+                                const _bbp = new T.Box3().setFromObject(playerHat);
+                                const topCenterWorldP = new T.Vector3((_bbp.min.x + _bbp.max.x) * 0.5, _bbp.max.y + 0.001, (_bbp.min.z + _bbp.max.z) * 0.5);
+                                const topCenterLocalP = playerHat.worldToLocal(topCenterWorldP.clone());
+                                const maxSpanP = Math.max(_bbp.max.x - _bbp.min.x, _bbp.max.z - _bbp.min.z);
+                                let diskRadiusP = Math.max(0.02, maxSpanP * 0.5 * 0.75);
+                                // apply user-requested absolute decrease of 0.03, clamp to minimum
+                                diskRadiusP = Math.max(0.02, diskRadiusP - 0.03);
+                                const diskGeoP = new T.CircleGeometry(diskRadiusP, 24);
+                                const diskMatP = new T.MeshStandardMaterial({ color: 0x000000, metalness: 0.05, roughness: 0.6 });
+                                const diskP = new T.Mesh(diskGeoP, diskMatP);
+                                diskP.rotation.set(-Math.PI / 2, 0, 0);
+                                diskP.position.copy(topCenterLocalP);
+                                try { diskP.position.y -= 1.0; diskP.position.z -= 0.25; } catch (e) {}
+                                diskP.userData = diskP.userData || {};
+                                diskP.userData.isHatFill = true;
+                                playerHat.add(diskP);
+                              } catch (e) {}
+                            } catch (e) {}
+                          }
+                        } catch (e) {}
+                      } catch (e) {}
+                    }
+                  } catch (e) {}
+                } catch (e) { console.warn('Alien head load callback error', e); }
+                resolve();
+              }, undefined, (err) => { console.warn('Failed to load Alien head OBJ', err); resolve(); });
+            } catch (e) { console.warn('Error preparing Alien head materials', e); resolve(); }
+          }, undefined, (err) => { console.warn('Failed to load Alien head MTL', err); resolve(); });
+        } catch (e) { console.warn('Error during dynamic Alien MTLLoader usage', e); resolve(); }
+      }).catch((e) => { console.warn('Failed to import MTLLoader dynamically for Alien head', e); resolve(); });
+    });
+  }
+} catch (e) { }
+
+// load Cutlass model (MTL + OBJ + PNG) for Full mode
+try {
+  if (typeof window !== 'undefined' && (window.__USE_TEXTURE_ATLAS__ || window.__FORCE_FULL__)) {
+    cutlassPromise = new Promise((resolve) => {
+      import('../libs/Three/examples/jsm/loaders/MTLLoader.js').then((mod) => {
+        try {
+          const MTLLoader = mod.MTLLoader;
+          const mtlPath = './models/Cutlass_texture_obj/Cutlass_1204004228_texture.mtl';
+          const objPath = './models/Cutlass_texture_obj/Cutlass_1204004228_texture.obj';
+          const mloader = new MTLLoader();
+          mloader.load(mtlPath, (materials) => {
+            try {
+              materials.preload();
+              const objL = new OBJLoader();
+              objL.setMaterials(materials);
+              objL.load(objPath, (o) => {
+                try {
+                  cutlassModel = o;
+                  cutlassModel.traverse((c) => { if (c.isMesh && c.material) try { c.material.needsUpdate = true; } catch (e) {} });
+                  console.log('[mygame] Cutlass model loaded');
+                } catch (e) { console.warn('Cutlass load callback error', e); }
+                resolve();
+              }, undefined, (err) => { console.warn('Failed to load Cutlass OBJ', err); resolve(); });
+            } catch (e) { console.warn('Error preparing Cutlass materials', e); resolve(); }
+          }, undefined, (err) => { console.warn('Failed to load Cutlass MTL', err); resolve(); });
+        } catch (e) { console.warn('Error during dynamic Cutlass MTLLoader usage', e); resolve(); }
+      }).catch((e) => { console.warn('Failed to import MTLLoader dynamically for Cutlass', e); resolve(); });
+    });
+  }
+} catch (e) { }
 
 // --- Beam attack (player) ---
 let beamActive = false;
@@ -122,12 +523,24 @@ function getPlayerEyePosAndDir(outEye, outDir) {
 
 // create a simple beam mesh (thin box) oriented along +X in local space
 function createBeamMesh(length) {
-  const geom = new T.BoxGeometry(length, 0.08, 0.28);
-  const mat = new T.MeshBasicMaterial({ color: 0x66ffff, transparent: true, opacity: 0.7, depthWrite: false });
-  const m = new T.Mesh(geom, mat);
-  m.userData = m.userData || {};
-  m.userData.length = length;
-  return m;
+  // create a Group containing two cylindrical beams (one per eye).
+  const g = new T.Group();
+  // cylinder default axis is Y; rotate so axis aligns with +X
+  const cylGeom = new T.CylinderGeometry(0.06, 0.06, length, 12);
+  cylGeom.rotateZ(Math.PI / 2);
+  const matL = new T.MeshBasicMaterial({ color: 0xff0000, transparent: true, opacity: 0.85, depthWrite: false });
+  const matR = matL.clone();
+  const left = new T.Mesh(cylGeom, matL);
+  const right = new T.Mesh(cylGeom, matR);
+  left.userData = left.userData || {};
+  right.userData = right.userData || {};
+  left.userData.length = length;
+  right.userData.length = length;
+  left.userData.isBeamLeft = true;
+  right.userData.isBeamRight = true;
+  g.add(left);
+  g.add(right);
+  return g;
 }
 
 function activateBeam() {
@@ -141,7 +554,7 @@ function activateBeam() {
   try { if (typeof beamAmmo === 'number') { beamAmmo = Math.max(0, beamAmmo - 1); updateHUD(); } } catch (e) {}
   // create visual
   try {
-    if (beamMesh) { try { scene.remove(beamMesh); disposeObject(beamMesh); } catch (e) {} beamMesh = null; }
+    if (beamMesh) { try { scene.remove(beamMesh); try { beamMesh.traverse((c)=>{ try{ disposeObject(c); }catch(e){} }); } catch(e){} try { disposeObject(beamMesh); } catch(e){} } catch (e) {} beamMesh = null; }
     beamMesh = createBeamMesh(BEAM_LENGTH);
     scene.add(beamMesh);
   } catch (e) { beamMesh = null; }
@@ -154,6 +567,17 @@ function setPlayerColor(hex) {
     player.mesh.traverse((c) => {
       // don't recolor eyeballs (they should stay black/white independent of body color)
       try { if (c.userData && c.userData.isEye) return; } catch (e) {}
+      // don't recolor textured materials (they use maps) or alien head meshes
+      try { if (c.userData && c.userData.isAlienHead) return; } catch (e) {}
+      try { if (c.material && c.material.map) return; } catch (e) {}
+      // don't recolor anything that is part of the player's hat: skip if any ancestor is marked isPlayerHat
+      try {
+        let anc = c;
+        while (anc) {
+          try { if (anc.userData && anc.userData.isPlayerHat) return; } catch (e) {}
+          anc = anc.parent;
+        }
+      } catch (e) {}
       if (c.material) {
         if (Array.isArray(c.material)) c.material.forEach(m => m.color && m.color.set(hex));
         else c.material.color && c.material.color.set(hex);
@@ -307,11 +731,36 @@ function createCollectibleMesh(type) {
     const geo = new T.OctahedronGeometry(0.18);
     return new T.Mesh(geo, mat);
   } else {
-    // chest — give a warm glow so it's visible
+    // chest — prefer an OBJ model in Full mode if available, otherwise keep primitive
+    const isFull = (typeof window !== 'undefined') && (window.__USE_TEXTURE_ATLAS__ || window.__FORCE_FULL__);
+    if (isFull && treasureChestModel) {
+      try {
+        const clone = treasureChestModel.clone(true);
+        // attempt to normalize scale so it sits roughly where the primitive did
+        try {
+          // compute bounding box and scale to approximate primitive size
+          const bb = new T.Box3().setFromObject(clone);
+          const size = new T.Vector3(); bb.getSize(size);
+          // double the previous full-model target size again (make OBJ noticeably larger)
+          const targetW = 1.36, targetH = 0.8, targetD = 0.88;
+          const sx = targetW / (size.x || 1);
+          const sy = targetH / (size.y || 1);
+          const sz = targetD / (size.z || 1);
+          const s = Math.min(sx, sy, sz) * 0.95; // slightly smaller to be safe
+          clone.scale.set(s, s, s);
+        } catch (e) {}
+        // position so base sits at y=0 (primitive half-height is 0.2; full-model doubled again -> half-height ~0.4)
+        try { clone.position.y = 0.4; } catch (e) {}
+        return clone;
+      } catch (e) {
+        // fall back to primitive on any error
+      }
+    }
+    // primitive fallback: give a warm glow so it's visible (double size)
     const mat = new T.MeshStandardMaterial({ color: 0x8b4513, metalness: 0.1, roughness: 0.45, emissive: 0x442200, emissiveIntensity: 1 });
-    const geo = new T.BoxGeometry(0.34, 0.2, 0.22);
+    const geo = new T.BoxGeometry(0.68, 0.4, 0.44);
     const m = new T.Mesh(geo, mat);
-    m.position.y = 0.1;
+    m.position.y = 0.2; // half of 0.4
     return m;
   }
 }
@@ -428,6 +877,8 @@ function updateCollectibles(dt) {
 const FISH_COUNT = 50;
 const FISH_Y_OPTIONS = [0.2, -0.8, -1.8];
 const FISH_SPEED = 1.6;
+// margin (in world units) to keep fish spawns inset from map edges so they don't escape
+const FISH_SPAWN_MARGIN = 10;
 const COHESION_RADIUS = 4.0;
 const COHESION_STRENGTH = 1.5; // how strongly fish move toward neighbors
 const FISH_JITTER = 0.6;
@@ -437,6 +888,138 @@ function randomPastel() {
   const g = 120 + Math.floor(Math.random() * 135);
   const b = 120 + Math.floor(Math.random() * 135);
   return (r << 16) | (g << 8) | b;
+}
+
+// create a splash effect at given world x,z when entering water threshold
+function spawnSplashAt(x, z) {
+  try {
+    if (!splashGroup) {
+      splashGroup = new T.Group();
+      splashGroup.userData = splashGroup.userData || {};
+      scene.add(splashGroup);
+    }
+    // choose water color from terrainData if available
+    let splashColor = 0x3366ff;
+    try { if (terrainData && terrainData.matWater && terrainData.matWater.color) splashColor = terrainData.matWater.color.getHex(); } catch (e) {}
+    const mat = new T.MeshStandardMaterial({ color: splashColor, metalness: 0.0, roughness: 0.9 });
+    // spawn ~15 small spheres
+    const count = 15;
+    for (let i = 0; i < count; ++i) {
+      const r = 0.03 + Math.random() * 0.04;
+      const geo = new T.SphereGeometry(r, 6, 6);
+      const m = new T.Mesh(geo, mat);
+      // start at water surface
+      const waterY = (terrainData && terrainData.matWater) ? (SEA_LEVEL + 1 - 0.01) : 0.0;
+      // choose a random angle and radial offset so particles arc outward from the center
+      const angle = Math.random() * Math.PI * 2;
+      const startOffset = 0.02 + Math.random() * 0.18; // small radial start offset
+      const sx = x + Math.cos(angle) * startOffset;
+      const sz = z + Math.sin(angle) * startOffset;
+      m.position.set(sx, waterY, sz);
+      // radial speed outward (varying) and upward velocity
+      const radialSpeed = 0.8 + Math.random() * 2.2; // horizontal speed magnitude
+      const vx = Math.cos(angle) * radialSpeed;
+      const vz = Math.sin(angle) * radialSpeed;
+      const vy = 2.2 + Math.random() * 1.8; // upward speed
+      splashGroup.add(m);
+      splashParticles.push({ mesh: m, vel: new T.Vector3(vx, vy, vz), startY: waterY });
+    }
+  } catch (e) { console.warn('spawnSplashAt failed', e); }
+}
+
+function updateSplashes(dt) {
+  if (!splashParticles || splashParticles.length === 0) return;
+  const gravity = -9.8;
+  for (let i = splashParticles.length - 1; i >= 0; --i) {
+    const p = splashParticles[i];
+    try {
+      // integrate
+      p.vel.y += gravity * dt;
+      p.mesh.position.addScaledVector(p.vel, dt);
+      // when particle returns to or below startY and is moving downward, remove it
+      if (p.mesh.position.y <= p.startY && p.vel.y < 0) {
+        try { splashGroup.remove(p.mesh); disposeObject(p.mesh); } catch (e) {}
+        splashParticles.splice(i, 1);
+      }
+    } catch (e) {}
+  }
+  // if group empty, remove it from scene
+  try { if (splashGroup && splashParticles.length === 0) { scene.remove(splashGroup); splashGroup = null; } } catch (e) {}
+}
+
+// apply loaded pirate face textures to already-spawned pirates
+function applyPirateTextures() {
+  try {
+    if (!pirates || pirates.length === 0) return;
+    for (let i = 0; i < pirates.length; ++i) {
+      const p = pirates[i];
+      if (!p || !p.mesh) continue;
+      try {
+        // create/update front/back planes on the torso so textures are visible
+        p.mesh.traverse((c) => {
+          try {
+            if (c && c.userData && c.userData.isPirateTorso) {
+              try { createOrUpdatePiratePlanesForTorso(c); } catch (e) {}
+            }
+          } catch (e) {}
+        });
+      } catch (e) {}
+    }
+  } catch (e) {}
+}
+
+function createOrUpdatePiratePlanesForTorso(torso) {
+  try {
+    if (!torso) return;
+    // compute torso size from bounding box
+    const bb = new T.Box3().setFromObject(torso);
+    const size = new T.Vector3(); bb.getSize(size);
+    const w = Math.max(0.1, size.x * 0.9);
+    const h = Math.max(0.1, size.y * 0.9);
+    const d = Math.max(0.05, size.z);
+    // small offset to avoid z-fighting with torso faces
+    const offset = 0.02 + d * 0.01;
+
+    // front plane
+    let front = torso.getObjectByName('pirateFrontPlane');
+    if (!front) {
+      const geo = new T.PlaneGeometry(w, h);
+      const mat = pirateChestTexture ? new T.MeshStandardMaterial({ map: pirateChestTexture, alphaTest: 0.4, side: T.DoubleSide }) : new T.MeshStandardMaterial({ color: 0xffffff });
+      front = new T.Mesh(geo, mat);
+      front.name = 'pirateFrontPlane';
+      front.userData = front.userData || {};
+      front.userData.isPirateFrontPlane = true;
+      // plane default faces +Z
+      front.position.set(0, 0, d / 2 + offset);
+      torso.add(front);
+    } else {
+      // update material if texture now available
+      try { if (pirateChestTexture) { front.material.map = pirateChestTexture; front.material.alphaTest = 0.4; front.material.side = T.DoubleSide; front.material.needsUpdate = true; } } catch (e) {}
+      // adjust geometry if size changed
+      try { front.geometry.dispose(); front.geometry = new T.PlaneGeometry(w, h); } catch (e) {}
+      front.position.set(0, 0, d / 2 + offset);
+    }
+
+    // back plane
+    let back = torso.getObjectByName('pirateBackPlane');
+    if (!back) {
+      const geo = new T.PlaneGeometry(w, h);
+      const mat = pirateBackTexture ? new T.MeshStandardMaterial({ map: pirateBackTexture, alphaTest: 0.4, side: T.DoubleSide }) : new T.MeshStandardMaterial({ color: 0xffffff });
+      back = new T.Mesh(geo, mat);
+      back.name = 'pirateBackPlane';
+      back.userData = back.userData || {};
+      back.userData.isPirateBackPlane = true;
+      // rotate to face -Z
+      back.rotation.y = Math.PI;
+      back.position.set(0, 0, -d / 2 - offset);
+      torso.add(back);
+    } else {
+      try { if (pirateBackTexture) { back.material.map = pirateBackTexture; back.material.alphaTest = 0.4; back.material.side = T.DoubleSide; back.material.needsUpdate = true; } } catch (e) {}
+      try { back.geometry.dispose(); back.geometry = new T.PlaneGeometry(w, h); } catch (e) {}
+      back.rotation.y = Math.PI;
+      back.position.set(0, 0, -d / 2 - offset);
+    }
+  } catch (e) {}
 }
 
 // create a simple low-poly fish group (body + tail). Returns a Group.
@@ -482,71 +1065,245 @@ function createPirateMesh(behavior) {
   const leftLeg = new T.Mesh(leftLegGeo, mat); leftLeg.position.set(-torsoW*0.22, legH, 0); g.add(leftLeg);
   const rightLegGeo = new T.BoxGeometry(legW, legH, legD); rightLegGeo.translate(0, -legH/2, 0);
   const rightLeg = new T.Mesh(rightLegGeo, mat); rightLeg.position.set(torsoW*0.22, legH, 0); g.add(rightLeg);
-  const torso = new T.Mesh(new T.BoxGeometry(torsoW, torsoH, torsoD), mat); torso.position.set(0, legH + torsoH/2, 0); g.add(torso);
+  const torsoGeo = new T.BoxGeometry(torsoW, torsoH, torsoD);
+  let torso = null;
+  try {
+    if (isFull && (pirateBackTexture || pirateChestTexture)) {
+      // Create per-face materials: order is [right, left, top, bottom, front, back]
+      const rightMat = new T.MeshStandardMaterial({ color: 0xffffff });
+      const leftMat = new T.MeshStandardMaterial({ color: 0xffffff });
+      const topMat = new T.MeshStandardMaterial({ color: 0xffffff });
+      const bottomMat = new T.MeshStandardMaterial({ color: 0xffffff });
+      const frontMat = pirateChestTexture ? new T.MeshStandardMaterial({ map: pirateChestTexture }) : new T.MeshStandardMaterial({ color: 0xffffff });
+      const backMat = pirateBackTexture ? new T.MeshStandardMaterial({ map: pirateBackTexture }) : new T.MeshStandardMaterial({ color: 0xffffff });
+      const mats = [rightMat, leftMat, topMat, bottomMat, frontMat, backMat];
+      torso = new T.Mesh(torsoGeo, mats);
+      try { torso.userData = torso.userData || {}; torso.userData.isPirateTorso = true; } catch (e) {}
+    } else {
+      torso = new T.Mesh(torsoGeo, mat);
+      try { torso.userData = torso.userData || {}; torso.userData.isPirateTorso = true; } catch (e) {}
+    }
+  } catch (e) {
+    torso = new T.Mesh(torsoGeo, mat);
+  }
+  torso.position.set(0, legH + torsoH/2, 0); g.add(torso);
+  try { createOrUpdatePiratePlanesForTorso(torso); } catch (e) {}
   const leftArmGeo = new T.BoxGeometry(armW, armH, armD); leftArmGeo.translate(0, -armH/2, 0);
   const leftArm = new T.Mesh(leftArmGeo, mat); leftArm.position.set(-torsoW/2 - armW/2, legH + torsoH, 0); g.add(leftArm);
+  // create an arm pivot at the shoulder so we can rotate the whole arm around a controllable pivot
+  const armPivot = new T.Group();
+  // align pivot with torso (z=0) so shoulder pivot sits in line with the torso
+  try { armPivot.position.set(torsoW/2 + armW/2, legH + torsoH - 0.06, 0); } catch (e) { armPivot.position.set(torsoW/2 + armW/2, legH + torsoH - 0.06, 0); }
+  g.add(armPivot);
+  // arm pivot debug marker removed (was used for tuning)
+
   const rightArmGeo = new T.BoxGeometry(armW, armH, armD); rightArmGeo.translate(0, -armH/2, 0);
-  const rightArm = new T.Mesh(rightArmGeo, mat); rightArm.position.set(torsoW/2 + armW/2, legH + torsoH - 0.06, 0.12); rightArm.rotation.x = -0.45; g.add(rightArm);
-  // sword on right arm
-  const sword = new T.Mesh(new T.BoxGeometry(0.05, 0.02, 0.6), new T.MeshStandardMaterial({ color: 0xcccccc }));
-  // position sword so the handle sits at the hand (arm pivot at shoulder, hand at y = -armH)
-  // move geometry so the handle is at local z=0 and blade extends forward (+Z)
-  try { sword.geometry.translate(0, 0, 0.3); } catch (e) {}
-  // place the sword slightly beyond the arm's end so it doesn't intersect the arm
-  // nudge sword slightly inward so it sits in the hand (not levitating)
-  // small visual tweak: move sword slightly further inward so it sits in the fist (reduce forward offset)
-  sword.position.set(0, -armH + 0.06, armD / 2 + 0.01);
-  // ensure sword aligns with arm orientation
-  sword.rotation.x = 0;
-  rightArm.add(sword);
-  const head = new T.Mesh(new T.BoxGeometry(headW, headH, headD), mat); head.position.set(0, legH + torsoH + headH/2, 0); g.add(head);
-  // add simple eyeballs on the front of the head
+  const rightArm = new T.Mesh(rightArmGeo, mat);
+  // position rightArm relative to the armPivot (pivot at shoulder); keep a small forward nudge
+  try { rightArm.position.set(0, 0, 0); } catch (e) { rightArm.position.set(0, 0, 0); }
+  rightArm.rotation.x = -0.45;
+  armPivot.add(rightArm);
+  // create a pivot at the hand so the weapon can rotate around the handle
+  const handPivot = new T.Group();
+  // place the pivot roughly where the hand should be relative to the arm
+  // place pivot further inside the arm (deeper along -Z)
+  // slightly up (+Y) and out (+Z) so pivot sits closer to the fist opening
+  // Move hand pivot forward by +0.08 on Z to match previous visible marker
+  try { handPivot.position.set(0, -armH + 0.08, armD / 2 - 0.06); } catch (e) { handPivot.position.set(0, -armH + 0.08, armD / 2 - 0.06); }
+  rightArm.add(handPivot);
+  // hand pivot debug marker removed (was used for tuning)
+  // sword on right arm - add to handPivot so rotation is around the handle
+  let sword = null;
   try {
-    const eyeMat = new T.MeshStandardMaterial({ color: 0x000000 });
-    const eyeSize = Math.min(headW, headH) * 0.12;
-  const leftEye = new T.Mesh(new T.SphereGeometry(eyeSize, 8, 8), eyeMat);
-  const rightEye = new T.Mesh(new T.SphereGeometry(eyeSize, 8, 8), eyeMat);
-  // mark as eyes so coloring routines skip them
-  try { leftEye.userData = leftEye.userData || {}; leftEye.userData.isEye = true; } catch (e) {}
-  try { rightEye.userData = rightEye.userData || {}; rightEye.userData.isEye = true; } catch (e) {}
-    // place eyes slightly forward on the face (+Z) and slightly up from center
-    leftEye.position.set(-headW * 0.18, 0.05 * headH, headD * 0.52);
-    rightEye.position.set(headW * 0.18, 0.05 * headH, headD * 0.52);
-    head.add(leftEye);
-    head.add(rightEye);
-  } catch (e) {}
+    const isFull = (typeof window !== 'undefined') && (window.__USE_TEXTURE_ATLAS__ || window.__FORCE_FULL__);
+    if (isFull && cutlassModel) {
+      try {
+        const clone = cutlassModel.clone(true);
+        // try to normalize scale so blade length ~0.6
+        try {
+          const bb = new T.Box3().setFromObject(clone);
+          const size = new T.Vector3(); bb.getSize(size);
+          const targetLen = 0.6;
+          const s = (targetLen / (size.z || targetLen)) / 3;
+          clone.scale.set(s, s, s);
+        } catch (e) {}
+        // position the cutlass relative to the hand pivot (handle at pivot)
+        try { clone.position.set(0, -0.1, 0.65); clone.rotation.set(-Math.PI / 2, -Math.PI / 2, 0); } catch (e) {}
+        handPivot.add(clone);
+        sword = clone;
+      } catch (e) { sword = null; }
+    }
+  } catch (e) { sword = null; }
+  if (!sword) {
+    // fallback primitive sword
+    sword = new T.Mesh(new T.BoxGeometry(0.05, 0.02, 0.6), new T.MeshStandardMaterial({ color: 0xcccccc }));
+    try { sword.geometry.translate(0, 0, 0.3); } catch (e) {}
+    // place blade so handle sits at pivot origin
+    try { sword.position.set(0, 0, 0); sword.rotation.x = 0; } catch (e) {}
+    handPivot.add(sword);
+  }
+  // expose pivot and sword for later adjustments and animation
+  try { g.handPivot = handPivot; g.sword = sword; g.armPivot = armPivot; } catch (e) {}
+  // head + eyes + hat differ between Prototype (primitive) and Full modes.
+  const isFull = (typeof window !== 'undefined') && (window.__USE_TEXTURE_ATLAS__ || window.__FORCE_FULL__);
+  let head;
+  if (!isFull) {
+    // Prototype / primitive: keep original box head and original procedural hat placement
+    head = new T.Mesh(new T.BoxGeometry(headW, headH, headD), mat);
+    head.position.set(0, legH + torsoH + headH / 2, 0);
+    g.add(head);
+    // add simple eyeballs on the front of the head (primitive positions)
+    try {
+      const eyeMat = new T.MeshStandardMaterial({ color: 0x000000 });
+      const eyeSize = Math.min(headW, headH) * 0.12;
+      const leftEye = new T.Mesh(new T.SphereGeometry(eyeSize, 8, 8), eyeMat);
+      const rightEye = new T.Mesh(new T.SphereGeometry(eyeSize, 8, 8), eyeMat);
+      try { leftEye.userData = leftEye.userData || {}; leftEye.userData.isEye = true; } catch (e) {}
+      try { rightEye.userData = rightEye.userData || {}; rightEye.userData.isEye = true; } catch (e) {}
+      leftEye.position.set(-headW * 0.18, 0.05 * headH, headD * 0.52);
+      rightEye.position.set(headW * 0.18, 0.05 * headH, headD * 0.52);
+      head.add(leftEye);
+      head.add(rightEye);
+    } catch (e) {}
+  } else {
+    // Full mode: spherical head (rounder) and eyes positioned for sphere
+    const headRadius = Math.max(headW, headH, headD) * 0.5;
+    head = new T.Mesh(new T.SphereGeometry(headRadius, 12, 10), mat);
+    head.position.set(0, legH + torsoH + headH / 2, 0);
+    g.add(head);
+    // add simple eyeballs on the front of the head (sphere positions)
+    try {
+      const eyeMat = new T.MeshStandardMaterial({ color: 0x000000 });
+      const eyeSize = Math.min(headW, headH) * 0.12;
+      const leftEye = new T.Mesh(new T.SphereGeometry(eyeSize, 8, 8), eyeMat);
+      const rightEye = new T.Mesh(new T.SphereGeometry(eyeSize, 8, 8), eyeMat);
+      try { leftEye.userData = leftEye.userData || {}; leftEye.userData.isEye = true; } catch (e) {}
+      try { rightEye.userData = rightEye.userData || {}; rightEye.userData.isEye = true; } catch (e) {}
+      leftEye.position.set(-headRadius * 0.36, 0.05 * headH, headRadius * 0.9);
+      rightEye.position.set(headRadius * 0.36, 0.05 * headH, headRadius * 0.9);
+      head.add(leftEye);
+      head.add(rightEye);
+    } catch (e) {}
+  }
   // hat color by behavior
-  let hatColor = 0x000000; if (behavior === 'align') hatColor = 0x00aa00; else if (behavior === 'separate') hatColor = 0xaa55ff; else if (behavior === 'cohere') hatColor = 0xffff55;
-  // build a simple pirate-style hat: a flat brim + a raised crown and a small white emblem
-  const hatGroup = new T.Group();
-  const hatMat = new T.MeshStandardMaterial({ color: hatColor, metalness: 0.05, roughness: 0.6 });
-  // brim: a low cylinder flattened to act like a broad brim
-  const brimRadius = Math.max(headW, headD) * 0.9;
-  const brimGeo = new T.CylinderGeometry(brimRadius, brimRadius, 0.06, 20);
-  const brim = new T.Mesh(brimGeo, hatMat);
-  // lay the brim flat (cylinder axis is Y); raise it slightly above head top
-  brim.rotation.x = Math.PI / 12;
-  brim.position.y = headH / 2 + 0.04;
-  hatGroup.add(brim);
-  // crown: smaller cylinder sitting above the brim
-  const crownGeo = new T.CylinderGeometry(brimRadius * 0.48, brimRadius * 0.58, 0.38, 16);
-  const crown = new T.Mesh(crownGeo, hatMat);
-  crown.position.y = headH / 2 + 0.26;
-  hatGroup.add(crown);
-  // small white skull emblem on the front of the hat for pirate flair
-  const skullSize = Math.min(headW, headD) * 0.18;
-  const skullGeo = new T.CircleGeometry(skullSize, 12);
-  const skullMat = new T.MeshBasicMaterial({ color: 0xffffff });
-  const skull = new T.Mesh(skullGeo, skullMat);
-  // place the emblem on the front face (positive Z) a little above brim
-  skull.position.set(0, headH / 2 + 0.12, brimRadius * 0.55);
-  // face the emblem outward (CircleGeometry faces +Z by default)
-  hatGroup.add(skull);
-  // slight tilt for style
-  hatGroup.rotation.z = -0.08;
-  head.add(hatGroup);
+  let hatColor = 0xcc0000; if (behavior === 'align') hatColor = 0x00aa00; else if (behavior === 'separate') hatColor = 0xaa55ff; else if (behavior === 'cohere') hatColor = 0xffff55;
+  // hat: prefer using an external model in Full mode if available, otherwise build procedurally
+  try {
+    if (isFull && pirateHatModel) {
+      try {
+        const hatClone = pirateHatModel.clone(true);
+        // scale down to 0.5 and nudge forward/up so it doesn't cover the face
+        hatClone.scale.set(0.5, 0.5, 0.5);
+        // raise hat 0.1 higher so it sits clear of the face
+        hatClone.position.set(0, headH / 2 + 0.24, 0.12);
+        hatClone.rotation.set(0, 0, -0.08);
+        // recolor cloned hat to match procedural hat color
+        // Clone materials so each hat instance has independent materials
+        try {
+          hatClone.traverse((c) => {
+            if (c && c.isMesh && c.material) {
+              try {
+                if (Array.isArray(c.material)) {
+                  c.material = c.material.map(m => m.clone());
+                  c.material.forEach(m => { try { m.color && m.color.set(hatColor); } catch (e) {} });
+                } else {
+                  c.material = c.material.clone();
+                  try { if (c.material.color) c.material.color.set(hatColor); } catch (e) {}
+                }
+              } catch (e) {}
+            }
+          });
+        } catch (e) {}
+        head.add(hatClone);
+        // add a simple disk above the head sized to the head dimensions
+        try {
+          // radius: head-based plus small offset (user adjustments)
+          const diskRadius = Math.max(0.02, Math.max(headW, headD) * 0.5 + 0.175);
+          const diskGeo = new T.CircleGeometry(diskRadius, 24);
+          const diskMat = new T.MeshStandardMaterial({ color: hatColor, metalness: 0.05, roughness: 0.6 });
+          const disk = new T.Mesh(diskGeo, diskMat);
+          disk.rotation.set(-Math.PI / 2, 0, 0); // make disk parallel to ground
+          // apply latest user adjustments: lower by another 0.05 and move back another 0.05
+          disk.position.set(0, headH / 2 - 0.17, -0.25);
+          disk.userData = disk.userData || {};
+          disk.userData.isHatFill = true;
+          hatClone.add(disk);
+        } catch (e) {}
+      } catch (e) {
+        // fall back to procedural hat below if clone fails
+        throw e;
+      }
+    } else {
+      // build a simple pirate-style hat: a flat brim + a raised crown and a small white emblem
+      const hatGroup = new T.Group();
+      const hatMat = new T.MeshStandardMaterial({ color: hatColor, metalness: 0.05, roughness: 0.6 });
+      // brim: a low cylinder flattened to act like a broad brim
+      const brimRadius = Math.max(headW, headD) * 0.9;
+      const brimGeo = new T.CylinderGeometry(brimRadius, brimRadius, 0.06, 20);
+      const brim = new T.Mesh(brimGeo, hatMat);
+      // lay the brim flat (cylinder axis is Y); raise it slightly above head top
+      brim.rotation.x = Math.PI / 12;
+      brim.position.y = headH / 2 + 0.04;
+      hatGroup.add(brim);
+      // crown: smaller cylinder sitting above the brim
+      const crownGeo = new T.CylinderGeometry(brimRadius * 0.48, brimRadius * 0.58, 0.38, 16);
+      const crown = new T.Mesh(crownGeo, hatMat);
+      crown.position.y = headH / 2 + 0.26;
+      hatGroup.add(crown);
+      // small white skull emblem on the front of the hat for pirate flair
+      const skullSize = Math.min(headW, headD) * 0.18;
+      const skullGeo = new T.CircleGeometry(skullSize, 12);
+      const skullMat = new T.MeshBasicMaterial({ color: 0xffffff });
+      const skull = new T.Mesh(skullGeo, skullMat);
+      // place the emblem on the front face (positive Z) a little above brim
+      skull.position.set(0, headH / 2 + 0.12, brimRadius * 0.55);
+      // face the emblem outward (CircleGeometry faces +Z by default)
+      hatGroup.add(skull);
+      // slight tilt for style
+      hatGroup.rotation.z = -0.08;
+      // In Prototype (primitive) mode we keep the original placement (no extra scale/pos).
+      if (isFull) {
+        // scale procedural hat down to match OBJ size and nudge forward for Full fallback
+        try { hatGroup.scale.set(0.5, 0.5, 0.5); hatGroup.position.set(0, headH / 2 + 0.08, 0.12); } catch (e) {}
+      }
+      hatGroup.userData = hatGroup.userData || {};
+      hatGroup.userData.isProceduralHat = true;
+      head.add(hatGroup);
+    }
+  } catch (e) {
+    try { console.warn('hat model attach failed, using procedural hat', e); } catch (e) {}
+    // graceful fallback: procedural hat
+    try {
+      const hatGroup = new T.Group();
+      const hatMat = new T.MeshStandardMaterial({ color: hatColor, metalness: 0.05, roughness: 0.6 });
+      const brimRadius = Math.max(headW, headD) * 0.9;
+      const brimGeo = new T.CylinderGeometry(brimRadius, brimRadius, 0.06, 20);
+      const brim = new T.Mesh(brimGeo, hatMat);
+      brim.rotation.x = Math.PI / 12;
+      brim.position.y = headH / 2 + 0.04;
+      hatGroup.add(brim);
+      const crownGeo = new T.CylinderGeometry(brimRadius * 0.48, brimRadius * 0.58, 0.38, 16);
+      const crown = new T.Mesh(crownGeo, hatMat);
+      crown.position.y = headH / 2 + 0.26;
+      hatGroup.add(crown);
+      const skullSize = Math.min(headW, headD) * 0.18;
+      const skullGeo = new T.CircleGeometry(skullSize, 12);
+      const skullMat = new T.MeshBasicMaterial({ color: 0xffffff });
+      const skull = new T.Mesh(skullGeo, skullMat);
+      skull.position.set(0, headH / 2 + 0.12, brimRadius * 0.55);
+      hatGroup.add(skull);
+      hatGroup.rotation.z = -0.08;
+      // keep original placement for prototype; for full fallback we'd have scaled above
+      try { if (isFull) hatGroup.scale.set(0.5, 0.5, 0.5); if (isFull) hatGroup.position.set(0, headH / 2 + 0.08, 0.12); } catch (e) {}
+      hatGroup.userData = hatGroup.userData || {};
+      hatGroup.userData.isProceduralHat = true;
+      head.add(hatGroup);
+    } catch (e) {}
+  }
   // expose for animation
   g.leftLeg = leftLeg; g.rightLeg = rightLeg; g.leftArm = leftArm; g.rightArm = rightArm; g.torso = torso; g.head = head;
+  // expose sword so update loop can animate it during attacks
+  try { g.sword = sword; } catch (e) {}
   g.userData = g.userData || {}; g.userData.behavior = behavior;
   return g;
 }
@@ -599,10 +1356,12 @@ function spawnPirateAttempt() {
   // lower pirates slightly so they sit more on the ground (avoid floating)
   const centerY = spawnTop + 1 + pHalf + PLAYER_Y_ADJUST - 0.2;
   m.position.set(ix + 0.5, centerY, iz + 0.5);
-    const ang = Math.random()*Math.PI*2; const vel = new T.Vector3(Math.cos(ang),0,Math.sin(ang)).multiplyScalar(PIRATE_SPEED);
+    const ang = Math.random()*Math.PI*2;
+    const vel = new T.Vector3(Math.cos(ang),0,Math.sin(ang)).multiplyScalar(PIRATE_SPEED);
+    const nowSec = (performance && performance.now) ? performance.now() * 0.001 : Date.now() * 0.001;
     piratesGroup.add(m);
     console.log('spawned pirate at', ix, centerY, iz, 'behavior', b);
-    pirates.push({ mesh: m, velocity: vel, behavior: b, half: pHalf });
+    pirates.push({ mesh: m, velocity: vel, behavior: b, half: pHalf, spawnTime: nowSec });
     break;
   }
 }
@@ -617,6 +1376,13 @@ function updatePirates(dt) {
   const occ = terrainData.occupancy;
   for (let i=pirates.length-1;i>=0;--i) {
     const p = pirates[i]; const m = p.mesh; const v = p.velocity;
+    // compute per-pirate effective speed that grows with lifetime
+    const _nowSec = (performance && performance.now) ? performance.now() * 0.001 : Date.now() * 0.001;
+    p.spawnTime = (typeof p.spawnTime === 'number') ? p.spawnTime : _nowSec;
+    const _age = Math.max(0, _nowSec - p.spawnTime);
+    const _growT = Math.max(0, Math.min(1, _age / PIRATE_GROW_TIME));
+    const _maxSpeed = PLAYER_SPEED * 1.5;
+    const effectiveSpeed = PIRATE_SPEED + (_maxSpeed - PIRATE_SPEED) * _growT;
     // handle hit timer (scheduled removal after being hit)
     if (p.hitTimer && p.hitTimer > 0) {
       p.hitTimer -= dt;
@@ -633,7 +1399,7 @@ function updatePirates(dt) {
     if (p.behavior === 'align' || p.behavior === 'cohere' || p.behavior === 'separate') {
       let count = 0; const center = new T.Vector3(); const align = new T.Vector3(); const sep = new T.Vector3();
       for (const o of pirates) { if (o===p) continue; const d2 = m.position.distanceToSquared(o.mesh.position); if (d2 > 16) continue; count++; center.add(o.mesh.position); align.add(o.velocity); const diff = new T.Vector3().subVectors(m.position, o.mesh.position); if (diff.lengthSq()>1e-6) { diff.normalize().divideScalar(Math.sqrt(d2)); sep.add(diff); } }
-      if (count>0) { center.multiplyScalar(1/count); align.multiplyScalar(1/count); sep.multiplyScalar(1/count); if (p.behavior==='cohere') { const toCenter = new T.Vector3().subVectors(center, m.position); toCenter.y=0; if (toCenter.lengthSq()>1e-6) { toCenter.normalize(); v.lerp(toCenter.multiplyScalar(PIRATE_SPEED), dt*0.6); } } if (p.behavior==='align') { align.y=0; if (align.lengthSq()>1e-6) { align.normalize(); v.lerp(align.multiplyScalar(PIRATE_SPEED), dt*0.8); } } if (p.behavior==='separate') { sep.y=0; if (sep.lengthSq()>1e-6) { sep.normalize(); v.lerp(sep.multiplyScalar(PIRATE_SPEED), dt*1.2); } } }
+      if (count>0) { center.multiplyScalar(1/count); align.multiplyScalar(1/count); sep.multiplyScalar(1/count); if (p.behavior==='cohere') { const toCenter = new T.Vector3().subVectors(center, m.position); toCenter.y=0; if (toCenter.lengthSq()>1e-6) { toCenter.normalize(); v.lerp(toCenter.multiplyScalar(effectiveSpeed), dt*0.6); } } if (p.behavior==='align') { align.y=0; if (align.lengthSq()>1e-6) { align.normalize(); v.lerp(align.multiplyScalar(effectiveSpeed), dt*0.8); } } if (p.behavior==='separate') { sep.y=0; if (sep.lengthSq()>1e-6) { sep.normalize(); v.lerp(sep.multiplyScalar(effectiveSpeed), dt*1.2); } } }
     }
 
     // global attraction: slightly bias all pirates toward the player's XZ position
@@ -641,16 +1407,16 @@ function updatePirates(dt) {
       if (player && player.mesh) {
         const toPlayer = new T.Vector3().subVectors(player.mesh.position, m.position);
         toPlayer.y = 0;
-        if (toPlayer.lengthSq() > 1e-6) {
+          if (toPlayer.lengthSq() > 1e-6) {
           toPlayer.normalize();
           // lerp velocity toward a velocity pointing at the player
           const attractFactor = Math.max(0, Math.min(1, PIRATE_ATTRACT_WEIGHT));
-          v.lerp(toPlayer.multiplyScalar(PIRATE_SPEED), dt * 0.6 * attractFactor);
+          v.lerp(toPlayer.multiplyScalar(effectiveSpeed), dt * 0.6 * attractFactor);
         }
       }
   } catch (e) {}
     // maintain speed
-    const tmp = new T.Vector3(v.x,0,v.z); if (tmp.lengthSq()>1e-6) { tmp.normalize().multiplyScalar(PIRATE_SPEED); v.x=tmp.x; v.z=tmp.z; }
+    const tmp = new T.Vector3(v.x,0,v.z); if (tmp.lengthSq()>1e-6) { tmp.normalize().multiplyScalar(effectiveSpeed); v.x=tmp.x; v.z=tmp.z; }
     // propose next (move in XZ, then snap Y to terrain topSolid for that column)
     const next = m.position.clone().addScaledVector(v, dt);
     // bounce only off map edge
@@ -669,22 +1435,85 @@ function updatePirates(dt) {
     // face move
     const look = m.position.clone().add(v); m.lookAt(look);
     // simple limb animation
-    try { const t = (performance && performance.now ? performance.now()*0.001 : Date.now()*0.001); if (m.leftLeg && m.rightLeg) { m.leftLeg.rotation.x = Math.sin(t*4)*0.5; m.rightLeg.rotation.x = -Math.sin(t*4)*0.5; } } catch(e) {}
-    // check hit player (XZ only) — if pirate hits player, mark as hit and remove after 1s
+    try {
+      const tnow = (performance && performance.now ? performance.now()*0.001 : Date.now()*0.001);
+      // If pirate is in attack animation, override rightArm and sword rotation to perform lift->strike->straighten
+      if (p.attacking) {
+        try {
+          p.attackElapsed = (p.attackElapsed || 0) + dt;
+          const ph = p.attackPhases || { liftDuration: 0.25, strikeDuration: 0.15, holdDuration: 0.45 };
+          const l = ph.liftDuration || 0.25;
+          const s = ph.strikeDuration || 0.15;
+          const h = ph.holdDuration || 0.45;
+          const ae = Math.min(p.attackElapsed, l + s + h);
+          if (ae < l) {
+            // lift: rotate shoulder pivot up toward target (90 degrees up)
+            const u = ae / l;
+            const base = (typeof p._armBaseRotX === 'number') ? p._armBaseRotX : 0;
+            const tgtUp = (typeof p._armTargetUp === 'number') ? p._armTargetUp : (base - Math.PI / 2);
+            const armRot = base + (tgtUp - base) * u;
+            try { if (m.armPivot) m.armPivot.rotation.x = armRot; } catch (e) {}
+            // keep handPivot at base during lift
+            try { if (m.handPivot) m.handPivot.rotation.x = (typeof p._handPivotBase === 'number' ? p._handPivotBase : 0); } catch (e) {}
+          } else if (ae < l + s) {
+            // strike: rotate arm down toward down-target while hand pivot rotates down simultaneously
+            const u = (ae - l) / s;
+            const armUp = (typeof p._armTargetUp === 'number') ? p._armTargetUp : ((typeof p._armBaseRotX === 'number' ? p._armBaseRotX : 0) - Math.PI / 2);
+            const armDown = (typeof p._armTargetDown === 'number') ? p._armTargetDown : ((typeof p._armBaseRotX === 'number' ? p._armBaseRotX : 0) + Math.PI / 4);
+            const handBase = (typeof p._handPivotBase === 'number') ? p._handPivotBase : 0;
+            const handDown = (typeof p._handPivotTargetDown === 'number') ? p._handPivotTargetDown : (handBase + Math.PI / 4);
+            const armRot = armUp + (armDown - armUp) * u;
+            const handRot = handBase + (handDown - handBase) * u;
+            try { if (m.armPivot) m.armPivot.rotation.x = armRot; } catch (e) {}
+            try { if (m.handPivot) m.handPivot.rotation.x = handRot; } catch (e) {}
+          } else {
+            // hold final strike pose: arm down target and hand down target
+            try { if (m.armPivot) m.armPivot.rotation.x = (typeof p._armTargetDown === 'number' ? p._armTargetDown : ((typeof p._armBaseRotX === 'number' ? p._armBaseRotX : 0) + Math.PI / 4)); } catch (e) {}
+            try { if (m.handPivot) m.handPivot.rotation.x = (typeof p._handPivotTargetDown === 'number' ? p._handPivotTargetDown : ((typeof p._handPivotBase === 'number' ? p._handPivotBase : 0) + Math.PI / 4)); } catch (e) {}
+          }
+        } catch (e) {}
+      }
+      // always animate legs for walking
+      try { if (m.leftLeg && m.rightLeg) { m.leftLeg.rotation.x = Math.sin(tnow*4)*0.5; m.rightLeg.rotation.x = -Math.sin(tnow*4)*0.5; } } catch(e) {}
+    } catch(e) {}
+    // check hit player (XZ only) — if pirate hits player, perform a single damage and play attack animation
     if (player && player.mesh) {
       const dx = player.mesh.position.x - m.position.x;
       const dz = player.mesh.position.z - m.position.z;
       const d2xz = dx*dx + dz*dz;
       if (d2xz <= PIRATE_ATTACK_RADIUS * PIRATE_ATTACK_RADIUS) {
         try {
-          // decrement lives immediately and give immediate feedback
-          lives = Math.max(0, lives-1);
-          updateHUD();
-          try { if (lives <= 0) showGameOver(); } catch (e) {}
-          try { player.flashTimer = 1.0; setPlayerColor(0xff0000); } catch(e) {}
+          // only damage player once per pirate
+          if (!p.didDamage) {
+            p.didDamage = true;
+            lives = Math.max(0, lives - 1);
+            updateHUD();
+            try { if (lives <= 0) showGameOver(); } catch (e) {}
+            try { player.flashTimer = 1.0; setPlayerColor(0xff0000); } catch (e) {}
+          }
         } catch (e) {}
-        // remove this pirate immediately
-        try { removePirateAtIndex(i); } catch (e) {}
+        // start attack animation (lift then strike) and schedule removal after animation
+        if (!p.attacking) {
+          p.attacking = true;
+          p.attackElapsed = 0;
+          p.attackPhases = { liftDuration: 0.25, strikeDuration: 0.15, holdDuration: 0.45 };
+          p.attackDuration = p.attackPhases.liftDuration + p.attackPhases.strikeDuration + p.attackPhases.holdDuration;
+          // reuse existing hitTimer to schedule removal after animation
+          p.hitTimer = p.attackDuration;
+          // record base pivot rotations so lerp is smooth and animate only pivots
+          try { p._armBaseRotX = (m.armPivot && typeof m.armPivot.rotation.x === 'number') ? m.armPivot.rotation.x : 0; } catch (e) { p._armBaseRotX = 0; }
+          // lift target: raise shoulder pivot by 90 degrees from base
+          p._armTargetUp = (typeof p._armBaseRotX === 'number') ? (p._armBaseRotX - Math.PI / 2) : -Math.PI / 2;
+          // down/strike target: rotate shoulder pivot down 45 degrees relative to the lifted angle
+          // (i.e., arm will come down only 45° from the lifted pose)
+          p._armTargetDown = (typeof p._armTargetUp === 'number') ? (p._armTargetUp + Math.PI / 4) : ((typeof p._armBaseRotX === 'number') ? (p._armBaseRotX + Math.PI / 4) : (Math.PI / 4));
+          try { p._handPivotBase = (m.handPivot && typeof m.handPivot.rotation.x === 'number') ? m.handPivot.rotation.x : 0; } catch (e) { p._handPivotBase = 0; }
+          // hand pivot will rotate down 45 degrees during the strike
+          // add extra 10 degrees (in radians) to hand pivot down target when arm comes down
+          const EXTRA_HAND_DOWN = Math.PI / 6;
+          p._handPivotTargetDown = (typeof p._handPivotBase === 'number') ? (p._handPivotBase + Math.PI / 4 + EXTRA_HAND_DOWN) : (Math.PI / 4 + EXTRA_HAND_DOWN);
+        }
+        // don't remove immediately; allow animation to run then removal will happen via hitTimer branch above
         continue;
       }
     }
@@ -828,9 +1657,9 @@ function createOnScreenButtons() {
   // append and absolutely position inside the parent (bottom-right)
   parent.appendChild(jumpBtn);
   jumpBtn.style.position = "absolute";
-  // place Jump at fixed coordinates inside an 800x800 game canvas (x=725, y=725)
-  jumpBtn.style.left = "725px";
-  jumpBtn.style.top = "725px";
+  // place Jump at fixed coordinates inside an 600x600 game canvas (x=325, y=325)
+  jumpBtn.style.left = "525px";
+  jumpBtn.style.top = "525px";
   jumpBtn.style.zIndex = "999";
   // clamp max size so it won't overflow on very large screens
   jumpBtn.style.maxWidth = "120px";
@@ -1165,6 +1994,13 @@ function buildPrototype() {
           try { if (typeof dirtMesh !== 'undefined' && dirtMesh) _applyAtlasToMesh(dirtMesh, 'dirt', t); } catch (e) {}
           try { if (typeof grassMesh !== 'undefined' && grassMesh) _applyAtlasToMesh(grassMesh, 'grass', t); } catch (e) {}
         });
+        // also attempt to preload pirate face textures for Full mode
+        try {
+          pirateBackTexture = loader.load('./textures/back.png', (tt) => { try { tt.needsUpdate = true; } catch (e) {} finally { try { applyPirateTextures(); } catch (e) {} } });
+        } catch (e) {}
+        try {
+          pirateChestTexture = loader.load('./textures/chest.png', (tt) => { try { tt.needsUpdate = true; } catch (e) {} finally { try { applyPirateTextures(); } catch (e) {} } });
+        } catch (e) {}
       } catch (e) { console.warn('atlas load failed', e); }
     }
 
@@ -1268,32 +2104,212 @@ function buildPrototype() {
     return { grassMesh, dirtMesh, stoneMesh, waterMesh, half, heightMap, matWater, occupancy };
   }
 
-  // generate terrain and place player
-  const terr = generateTerrain(MAP_SIZE);
-  terrainData = terr;
+  // Procedural skybox generator: night ocean with moon, stars, and clouds
+  function createProceduralNightSkybox(renderer, faceSize) {
+    faceSize = faceSize || 1024;
+    // helper: create a canvas and 2D context
+    function makeCanvas() {
+      const c = document.createElement('canvas');
+      c.width = faceSize; c.height = faceSize;
+      return c;
+    }
 
-  // spawn fish after terrain exists
-  if (terrainData && terrainData.heightMap) {
-    // create a group to hold fish meshes so we can clear them easily
-    if (fishGroup) try { scene.remove(fishGroup); } catch (e) {}
-    fishGroup = new T.Group();
-    scene.add(fishGroup);
-    spawnFishes(FISH_COUNT);
-    // spawn a bunch of pirates immediately so players see them without waiting
+    // draw a sky face: sky gradient + stars + optional moon/cloudds
+    function drawSky(ctx, w, h, opts) {
+      opts = opts || {};
+      // background gradient (deep night)
+      const g = ctx.createLinearGradient(0, 0, 0, h);
+      g.addColorStop(0, '#021026');
+      g.addColorStop(0.5, '#021733');
+      g.addColorStop(1, '#001022');
+      ctx.fillStyle = g; ctx.fillRect(0, 0, w, h);
+
+      // soft clouds: draw a few translucent ellipses with blur
+      try {
+        ctx.save();
+        ctx.globalAlpha = 0.12;
+        ctx.fillStyle = '#dfefff';
+        ctx.filter = 'blur(18px)';
+        const cloudCount = opts.clouds === false ? 0 : 6;
+        for (let i = 0; i < cloudCount; ++i) {
+          const cx = Math.random() * w;
+          const cy = Math.random() * (h * 0.6);
+          const rw = (0.15 + Math.random() * 0.3) * w;
+          const rh = rw * (0.18 + Math.random() * 0.25);
+          ctx.beginPath();
+          ctx.ellipse(cx, cy, rw, rh, Math.random() * 0.6, 0, Math.PI * 2);
+          ctx.fill();
+        }
+        ctx.filter = 'none';
+        ctx.restore();
+      } catch (e) { /* ignore filter if unsupported */ }
+
+      // stars
+      const starCount = 450;
+      for (let s = 0; s < starCount; ++s) {
+        const x = Math.random() * w;
+        const y = Math.random() * h * 0.85;
+        const r = Math.random() * 1.4;
+        const alpha = 0.6 + Math.random() * 0.5;
+        ctx.fillStyle = 'rgba(255,255,255,' + alpha + ')';
+        ctx.beginPath();
+        ctx.arc(x, y, r, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      // optional moon
+      if (opts.moon) {
+        const mx = opts.moon.x * w;
+        const my = opts.moon.y * h;
+        const mr = opts.moon.r * Math.min(w, h);
+        // glow
+        try { ctx.save(); ctx.filter = 'blur(20px)'; ctx.globalAlpha = 0.6; ctx.fillStyle = '#fff9ee'; ctx.beginPath(); ctx.arc(mx, my, mr * 1.6, 0, Math.PI * 2); ctx.fill(); ctx.restore(); } catch (e) { }
+        // moon body
+        ctx.beginPath();
+        const moonGrad = ctx.createRadialGradient(mx, my, 0, mx, my, mr);
+        moonGrad.addColorStop(0, '#fffef0');
+        moonGrad.addColorStop(1, '#f2e9d8');
+        ctx.fillStyle = moonGrad;
+        ctx.arc(mx, my, mr, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
+    // draw an ocean face for bottom (negY) with horizon and moon reflection
+    function drawOcean(ctx, w, h, moonOpts) {
+      // dark ocean gradient
+      const g = ctx.createLinearGradient(0, 0, 0, h);
+      g.addColorStop(0, '#021733');
+      g.addColorStop(1, '#000814');
+      ctx.fillStyle = g; ctx.fillRect(0, 0, w, h);
+      // stars on ocean face too (so stars appear on all faces)
+      const starCount = 220;
+      for (let s = 0; s < starCount; ++s) {
+        const x = Math.random() * w;
+        const y = Math.random() * h * 0.9;
+        const r = Math.random() * 1.2;
+        const alpha = 0.45 + Math.random() * 0.6;
+        ctx.fillStyle = 'rgba(255,255,255,' + alpha + ')';
+        ctx.beginPath();
+        ctx.arc(x, y, r, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      // (waves removed) keep ocean darker and rely on moon reflection for realism
+      // moon reflection: vertical soft streak
+      if (moonOpts) {
+        const mx = moonOpts.x * w;
+        const my = moonOpts.y * h;
+        const mr = moonOpts.r * Math.min(w, h);
+        const reflWidth = mr * 0.9;
+        try {
+          ctx.save(); ctx.globalAlpha = 0.28; ctx.filter = 'blur(18px)';
+          const lin = ctx.createLinearGradient(mx, my, mx, h);
+          lin.addColorStop(0, 'rgba(255,255,230,0.8)');
+          lin.addColorStop(1, 'rgba(255,255,230,0.0)');
+          ctx.fillStyle = lin;
+          ctx.fillRect(mx - reflWidth, my, reflWidth * 2, h - my);
+          ctx.restore();
+        } catch (e) { /* ignore */ }
+      }
+    }
+
+    // build six canvases for cube faces: +X, -X, +Y, -Y, +Z, -Z
+    const faces = [];
+    // choose a moon position roughly in the front face +Z
+    const moon = { x: 0.5, y: 0.28, r: 0.07 };
+    // +X
+    { const c = makeCanvas(); drawSky(c.getContext('2d'), faceSize, faceSize, { clouds: true }); faces.push(c); }
+    // -X
+    { const c = makeCanvas(); drawSky(c.getContext('2d'), faceSize, faceSize, { clouds: true }); faces.push(c); }
+    // +Y (up) - darker, stars concentrated
+    { const c = makeCanvas(); drawSky(c.getContext('2d'), faceSize, faceSize, { clouds: false, moon: false }); faces.push(c); }
+    // -Y (down) - ocean with reflection
+    { const c = makeCanvas(); drawOcean(c.getContext('2d'), faceSize, faceSize, moon); faces.push(c); }
+    // +Z (front) - place moon here
+    { const c = makeCanvas(); drawSky(c.getContext('2d'), faceSize, faceSize, { clouds: true, moon: moon }); faces.push(c); }
+    // -Z (back)
+    { const c = makeCanvas(); drawSky(c.getContext('2d'), faceSize, faceSize, { clouds: true }); faces.push(c); }
+
+    // Create a CubeTexture from canvases
+    const cubeTex = new T.CubeTexture(faces);
+    cubeTex.needsUpdate = true;
+    try { cubeTex.encoding = T.sRGBEncoding; } catch (e) {}
+
+    // Optionally create PMREM for environment lighting
     try {
-      for (let i = 0; i < 20; ++i) spawnPirateAttempt();
+      const pmrem = new T.PMREMGenerator(renderer);
+      const env = pmrem.fromCubemap(cubeTex);
+      // dispose pmrem helper
+      pmrem.dispose();
+      return { background: cubeTex, environment: env.texture };
+    } catch (e) {
+      return { background: cubeTex, environment: null };
+    }
+  }
+
+  // star reflection generator removed (debug/test feature)
+
+  // world initialization (terrain, fish, initial spawns, HUD, player)
+  function initWorld() {
+    // generate terrain and place player
+    const terr = generateTerrain(MAP_SIZE);
+    terrainData = terr;
+
+    // (no dynamic cube camera by default) keep water as a simple transparent plane
+
+    // spawn fish after terrain exists
+    if (terrainData && terrainData.heightMap) {
+      // create a group to hold fish meshes so we can clear them easily
+      if (fishGroup) try { scene.remove(fishGroup); } catch (e) {}
+      fishGroup = new T.Group();
+      scene.add(fishGroup);
+      spawnFishes(FISH_COUNT);
+      // spawn a bunch of pirates immediately so players see them without waiting
+      try {
+        // If Full mode wants to use an external hat model, prefer to wait until
+        // the model has loaded so initial pirates show the model hat instead of
+        // the procedural hat. We'll retry a few times with short delays.
+        const spawnInitialPirates = (attemptsLeft) => {
+          try {
+            const isFull = (typeof window !== 'undefined') && (window.__USE_TEXTURE_ATLAS__ || window.__FORCE_FULL__);
+            if (isFull && !pirateHatModel && attemptsLeft > 0) {
+              setTimeout(() => spawnInitialPirates(attemptsLeft - 1), 300);
+              return;
+            }
+            for (let i = 0; i < 5; ++i) spawnPirateAttempt();
+          } catch (e) {}
+        };
+        spawnInitialPirates(6);
+      } catch (e) {}
+    }
+    // initialize HUD and collectibles state
+    try {
+      initHUD();
+      // remove any previous collectibles group and reset accumulator
+      try { if (collectiblesGroup) { scene.remove(collectiblesGroup); } } catch (e) {}
+      collectiblesGroup = null;
+      collectibles = [];
+      collectSpawnAcc = 0;
+      updateHUD();
     } catch (e) {}
   }
-  // initialize HUD and collectibles state
+
+  // decide whether to wait for models in Full mode before starting
   try {
-    initHUD();
-    // remove any previous collectibles group and reset accumulator
-    try { if (collectiblesGroup) { scene.remove(collectiblesGroup); } } catch (e) {}
-    collectiblesGroup = null;
-    collectibles = [];
-    collectSpawnAcc = 0;
-    updateHUD();
-  } catch (e) {}
+    const isFullMode = (typeof window !== 'undefined') && (window.__USE_TEXTURE_ATLAS__ || window.__FORCE_FULL__);
+    if (isFullMode) {
+      showLoadingOverlay('Loading models...');
+      Promise.all([pirateHatPromise, treasureChestPromise, alienHeadPromise, cutlassPromise]).then(() => {
+        try { hideLoadingOverlay(); } catch (e) {}
+        try { initWorld(); } catch (e) { console.warn('initWorld failed', e); }
+      }).catch((e) => {
+        try { hideLoadingOverlay(); } catch (e) {}
+        try { initWorld(); } catch (e) { console.warn('initWorld failed', e); }
+      });
+    } else {
+      initWorld();
+    }
+  } catch (e) { initWorld(); }
 
   
 
@@ -1303,7 +2319,9 @@ function buildPrototype() {
   // topSolid + 1 as before.
   function createBlockyPlayerMesh() {
     const g = new T.Group();
-    const mat = new T.MeshStandardMaterial({ color: 0xD2B48C });
+    // make the player's body a bit shinier to better match the alien head in Full mode
+    // increase metalness and reduce roughness for a subtle glossy look
+    const mat = new T.MeshStandardMaterial({ color: 0x888888, metalness: 0.35, roughness: 0.28 });
 
     // dimensions (kept compact so overall height is similar to the previous cube)
     const legH = 0.5, legW = 0.22, legD = 0.22;
@@ -1345,24 +2363,61 @@ function buildPrototype() {
     g.add(rightArm);
 
     // head
-    const head = new T.Mesh(new T.BoxGeometry(headW, headH, headD), mat);
-    head.position.set(0, legH + torsoH + headH / 2, 0);
-    g.add(head);
+    const isFull = (typeof window !== 'undefined') && (window.__USE_TEXTURE_ATLAS__ || window.__FORCE_FULL__);
+    let head;
+    if (isFull && alienHeadModel) {
+      try {
+        // clone the loaded alien head model and try to scale it to roughly match the blocky head size
+        const modelClone = alienHeadModel.clone(true);
+        // mark meshes so recolor routines skip them
+        modelClone.traverse((c) => { try { if (c && c.isMesh) { c.userData = c.userData || {}; c.userData.isAlienHead = true; } } catch (e) {} });
+        // compute bounding box and scale to target head dimensions
+        try {
+          const bb = new T.Box3().setFromObject(modelClone);
+          const size = new T.Vector3(); bb.getSize(size);
+          const targetY = headH || 0.4;
+          const sx = targetY / (size.y || targetY);
+          const sxw = (headW || 0.44) / (size.x || headW || 0.44);
+          const sxd = (headD || 0.44) / (size.z || headD || 0.44);
+          const s = Math.min(sx, sxw, sxd) * 0.95;
+          // scale the alien head to 1.9x the original target size
+          modelClone.scale.set(s * 1.9, s * 1.9, s * 1.9);
+          // after scaling, recompute bbox and shift so the model base aligns with group origin
+          const bb2 = new T.Box3().setFromObject(modelClone);
+          modelClone.position.y -= bb2.min.y;
+          // nudge the alien head forward and down for a better fit on the player
+          try { modelClone.position.z += 0.092; modelClone.position.y -= 0.4; } catch (e) {}
+        } catch (e) {}
+        head = new T.Group();
+        head.add(modelClone);
+        head.position.set(0, legH + torsoH + headH / 2, 0);
+        g.add(head);
+      } catch (e) {
+        // fallback to primitive head if anything fails
+        head = new T.Mesh(new T.BoxGeometry(headW, headH, headD), mat);
+        head.position.set(0, legH + torsoH + headH / 2, 0);
+        g.add(head);
+      }
+    } else {
+      head = new T.Mesh(new T.BoxGeometry(headW, headH, headD), mat);
+      head.position.set(0, legH + torsoH + headH / 2, 0);
+      g.add(head);
 
-    // add simple eyeballs to the player head
-    try {
-      const eyeMat = new T.MeshStandardMaterial({ color: 0x000000 });
-      const eyeSize = Math.min(headW, headH) * 0.12;
-  const leftEye = new T.Mesh(new T.SphereGeometry(eyeSize, 8, 8), eyeMat);
-  const rightEye = new T.Mesh(new T.SphereGeometry(eyeSize, 8, 8), eyeMat);
-  // mark as eyes so coloring routines skip them
-  try { leftEye.userData = leftEye.userData || {}; leftEye.userData.isEye = true; } catch (e) {}
-  try { rightEye.userData = rightEye.userData || {}; rightEye.userData.isEye = true; } catch (e) {}
-      leftEye.position.set(-headW * 0.16, 0.05 * headH, headD * 0.52);
-      rightEye.position.set(headW * 0.16, 0.05 * headH, headD * 0.52);
-      head.add(leftEye);
-      head.add(rightEye);
-    } catch (e) {}
+      // add simple eyeballs to the player head (only for non-full or when model missing)
+      try {
+        const eyeMat = new T.MeshStandardMaterial({ color: 0x000000 });
+        const eyeSize = Math.min(headW, headH) * 0.12;
+        const leftEye = new T.Mesh(new T.SphereGeometry(eyeSize, 8, 8), eyeMat);
+        const rightEye = new T.Mesh(new T.SphereGeometry(eyeSize, 8, 8), eyeMat);
+        // mark as eyes so coloring routines skip them
+        try { leftEye.userData = leftEye.userData || {}; leftEye.userData.isEye = true; } catch (e) {}
+        try { rightEye.userData = rightEye.userData || {}; rightEye.userData.isEye = true; } catch (e) {}
+        leftEye.position.set(-headW * 0.16, 0.05 * headH, headD * 0.52);
+        rightEye.position.set(headW * 0.16, 0.05 * headH, headD * 0.52);
+        head.add(leftEye);
+        head.add(rightEye);
+      } catch (e) {}
+    }
 
     // expose limb parts on the group for animation later
     g.leftLeg = leftLeg;
@@ -1382,7 +2437,7 @@ function buildPrototype() {
   const pHeight = (bbox.max.y - bbox.min.y) || 1.0;
   const pHalf = pHeight / 2;
   // decide a spawn Y using the generated terrain's recorded topSolid
-  const spawnInfo = terr && terr.heightMap ? terr.heightMap[`0,0`] : null;
+  const spawnInfo = terrainData && terrainData.heightMap ? terrainData.heightMap[`0,0`] : null;
   const centerHeight = generateHeight(0, 0);
   const spawnTop = spawnInfo && typeof spawnInfo.topSolid === "number" ? spawnInfo.topSolid : centerHeight;
   // position group so its feet sit at spawnTop + 1 (our parts were built with feet at y=0)
@@ -1407,6 +2462,34 @@ function buildPrototype() {
   player.onGround = true;
   ensureControls();
 
+  // set a procedural night skybox background & environment if none provided
+  try {
+    const sky = createProceduralNightSkybox(renderer, 1024);
+    if (sky && sky.background) {
+      try { scene.background = sky.background; } catch (e) {}
+      try { if (sky.environment) scene.environment = sky.environment; } catch (e) {}
+    }
+  } catch (e) {}
+
+  // if we have a generated environment/PMREM, configure the water material
+  try {
+    const wmat = terrainData && terrainData.matWater ? terrainData.matWater : null;
+    if (wmat) {
+      try {
+        // Revert water material back to the original prototype defaults
+        // Keep a semi-transparent blue with depthWrite off so terrain shows through
+        try { if (wmat.color) wmat.color.setHex(0x3366ff); else wmat.color = new T.Color(0x3366ff); } catch (e) {}
+        wmat.transparent = true;
+        try { wmat.opacity = 0.55; } catch (e) {}
+        wmat.depthWrite = false;
+        // restore default PBR values (no forced metallic reflections)
+        try { wmat.metalness = 0.0; wmat.roughness = 1.0; } catch (e) {}
+        wmat.side = T.DoubleSide;
+        // (star reflection/emissive debug code removed)
+      } catch (e) {}
+    }
+  } catch (e) {}
+
   // lights
   let ambientLight = new T.AmbientLight(0xffffff, 0.6);
   scene.add(ambientLight);
@@ -1427,12 +2510,20 @@ function spawnFishes(count) {
     }
   }
   const half = terrainData.half || 0;
+  // compute inset spawn bounds so fish spawn at least FISH_SPAWN_MARGIN away from edges
+  const minX = -half + FISH_SPAWN_MARGIN;
+  const maxX = half - 1 - FISH_SPAWN_MARGIN;
+  const minZ = -half + FISH_SPAWN_MARGIN;
+  const maxZ = half - 1 - FISH_SPAWN_MARGIN;
+  const rangeX = Math.max(1, maxX - minX + 1);
+  const rangeZ = Math.max(1, maxZ - minZ + 1);
   const attemptsLimit = count * 20;
   let tries = 0;
   while (fishes.length < count && tries < attemptsLimit) {
     tries++;
-    const ix = Math.floor(Math.random() * (half * 2)) - half;
-    const iz = Math.floor(Math.random() * (half * 2)) - half;
+    // choose random coords inset from map edges to avoid escapes
+    const ix = Math.floor(Math.random() * rangeX) + minX;
+    const iz = Math.floor(Math.random() * rangeZ) + minZ;
     const info = terrainData.heightMap[`${ix},${iz}`];
     if (!info || info.topType !== "water") continue;
   // choose a vertical offset from the water surface for the fish
@@ -1591,7 +2682,7 @@ function animate(timestamp) {
       _worldMove.addScaledVector(_camForward, -_vMove.z);
       _worldMove.addScaledVector(_camRight, _vMove.x);
       _worldMove.normalize();
-      const speed = 3.0; // units per second
+      const speed = PLAYER_SPEED; // units per second
       player.mesh.position.addScaledVector(_worldMove, speed * timeDelta);
     }
 
@@ -1620,6 +2711,15 @@ function animate(timestamp) {
           // consider the player "submerged". Lower the threshold by 1.5
           // so the player must be deeper before swim mode engages.
           const submerged = feetY < (waterPlaneY - 1.5);
+          // detect threshold crossing to spawn splashes when entering water
+          try {
+            const prev = player.prevSubmerged || false;
+            if (!prev && submerged) {
+              // spawn splash at player's XZ (a bit ahead of the feet)
+              try { spawnSplashAt(player.mesh.position.x, player.mesh.position.z); } catch (e) {}
+            }
+            player.prevSubmerged = !!submerged;
+          } catch (e) {}
 
           if (submerged) {
             // feet are sufficiently under the surface
@@ -1742,15 +2842,18 @@ function animate(timestamp) {
   // update fish simulation
   try { updateCollectibles(timeDelta); } catch (e) {}
   try { if (fishGroup) updateFishes(timeDelta); } catch (e) {}
+  try { updateSplashes(timeDelta); } catch (e) {}
   controls.target.copy(player.mesh.position);
     controls.update();
+
+    // (star-reflection animation removed)
 
     // player flash handling: revert color when timer expires
     try {
       if (player && player.mesh && player.flashTimer && player.flashTimer > 0) {
         player.flashTimer = Math.max(0, player.flashTimer - timeDelta);
         if (player.flashTimer <= 0) {
-          setPlayerColor(0xD2B48C);
+          setPlayerColor(0x888888);
         }
       }
     } catch (e) {}
@@ -1768,41 +2871,81 @@ function animate(timestamp) {
         const dir = tmp.dir;
         const end = start.clone().addScaledVector(dir, BEAM_LENGTH);
 
-        // update beam mesh placement & orientation
+        // update beam meshes (we now have two cylindrical beams, one per eye)
         if (beamMesh) {
           // beam geometry is along +X locally, rotate +X to point direction
           const quat = new T.Quaternion();
           quat.setFromUnitVectors(new T.Vector3(1, 0, 0), dir);
-          beamMesh.quaternion.copy(quat);
-          beamMesh.position.copy(start).addScaledVector(dir, BEAM_LENGTH * 0.5);
-        }
 
-        // collision test against pirates: require both XZ intersection AND
-        // Y within a vertical band relative to the player so beam can hit head/legs.
-        const killR = 0.75; const killR2 = killR * killR;
-        const startXZ = start.clone(); startXZ.y = 0;
-        const endXZ = end.clone(); endXZ.y = 0;
-        // vertical hit window relative to player center: allow from -0.2 below player
-        // up to +1.4 above player (tweakable)
-        const playerCenterY = (player && player.mesh) ? player.mesh.position.y : start.y;
-        const minHitY = playerCenterY - 0.2;
-        const maxHitY = playerCenterY + 1.4;
-        for (let i = pirates.length - 1; i >= 0; --i) {
-          const p = pirates[i]; if (!p || !p.mesh) continue;
-          const pos = p.mesh.position;
-          // vertical check first (simple band)
-          if (pos.y < minHitY || pos.y > maxHitY) continue;
-          const posXZ = pos.clone(); posXZ.y = 0;
-          const d2 = pointToSegmentDistanceSq(posXZ, startXZ, endXZ);
-          if (d2 <= killR2) {
-            // immediate kill: award points and remove pirate
+          // try to find eye world positions (meshes marked with userData.isEye)
+          const eyeStarts = [];
+          try {
+            if (player && player.mesh && player.mesh.head) {
+              player.mesh.head.traverse((c) => {
+                try {
+                  if (c && c.userData && c.userData.isEye) {
+                    const wp = new T.Vector3();
+                    c.getWorldPosition(wp);
+                    eyeStarts.push(wp);
+                  }
+                } catch (e) {}
+              });
+            }
+          } catch (e) {}
+
+          // fallback: fabricate two eye positions offset perpendicular to beam direction
+          if (eyeStarts.length < 2) {
+            const rightVec = new T.Vector3().crossVectors(dir, new T.Vector3(0, 1, 0)).normalize();
+            // Use the primitive eye offset so Full-mode spacing matches Prototype exactly
+            const PRIMITIVE_EYE_OFFSET = 0.4 * 0.18; // headW (0.4) * 0.18 => 0.072
+            let offset = PRIMITIVE_EYE_OFFSET;
+            eyeStarts.length = 0;
+            eyeStarts.push(start.clone().addScaledVector(rightVec, -offset));
+            eyeStarts.push(start.clone().addScaledVector(rightVec, offset));
+          }
+
+          // position each child beam to originate from each eye
+          // If Full mode, nudge the start positions slightly forward so beams appear to exit the alien head
+          try {
+            const isFull = (typeof window !== 'undefined') && (window.__USE_TEXTURE_ATLAS__ || window.__FORCE_FULL__);
+            const FULL_BEAM_FORWARD = 0.2; // forward nudge for Full mode
+            if (isFull) {
+              for (let k = 0; k < eyeStarts.length; ++k) {
+                try { eyeStarts[k].addScaledVector(dir, FULL_BEAM_FORWARD); } catch (e) {}
+              }
+            }
+          } catch (e) {}
+          for (let bi = 0; bi < beamMesh.children.length; ++bi) {
+            const child = beamMesh.children[bi];
             try {
-              score += 5;
-              updateHUD();
+              const es = eyeStarts[bi] || eyeStarts[0];
+              child.quaternion.copy(quat);
+              child.position.copy(es).addScaledVector(dir, BEAM_LENGTH * 0.5);
             } catch (e) {}
-            try { removePirateAtIndex(i); } catch (e) {}
-            // continue to next (we removed this one)
-            continue;
+          }
+
+          // collision test against pirates for each eye beam
+          const killR = 0.75; const killR2 = killR * killR;
+          const playerCenterY = (player && player.mesh) ? player.mesh.position.y : start.y;
+          const minHitY = playerCenterY - 0.2;
+          const maxHitY = playerCenterY + 1.4;
+          for (let bi = 0; bi < eyeStarts.length; ++bi) {
+            const sPos = eyeStarts[bi];
+            const ePos = sPos.clone().addScaledVector(dir, BEAM_LENGTH);
+            const sXZ = sPos.clone(); sXZ.y = 0;
+            const eXZ = ePos.clone(); eXZ.y = 0;
+            for (let i = pirates.length - 1; i >= 0; --i) {
+              const p = pirates[i]; if (!p || !p.mesh) continue;
+              const pos = p.mesh.position;
+              if (pos.y < minHitY || pos.y > maxHitY) continue;
+              const posXZ = pos.clone(); posXZ.y = 0;
+              const d2 = pointToSegmentDistanceSq(posXZ, sXZ, eXZ);
+              if (d2 <= killR2) {
+                try { score += 5; updateHUD(); } catch (e) {}
+                try { removePirateAtIndex(i); } catch (e) {}
+                continue;
+              }
+            }
           }
         }
 
@@ -1810,7 +2953,7 @@ function animate(timestamp) {
         if (beamTimer <= 0) {
           beamActive = false;
           beamCooldown = BEAM_COOLDOWN;
-          if (beamMesh) { try { scene.remove(beamMesh); disposeObject(beamMesh); } catch (e) {} beamMesh = null; }
+          if (beamMesh) { try { scene.remove(beamMesh); try { beamMesh.traverse((c)=>{ try{ disposeObject(c); }catch(e){} }); } catch(e){} try { disposeObject(beamMesh); } catch(e){} } catch (e) {} beamMesh = null; }
         }
       }
     } catch (e) {}
