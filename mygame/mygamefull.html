@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    /* Constrain the canvas container to the game's fixed size and center it */
+    #div1 { width: 600px; margin: 0 auto; position: relative; }
+  </style>
+</head>
+<body>
+  <div id="pageHeader" style="padding:8px; text-align:center;">
+    <h1 style="margin:0; font-size:1.2rem;">Alien Pirate — Full mode (Group ID: 8821)</h1>
+    <div style="margin-top:6px;"><button id="toProtoBtn" style="padding:6px 10px; font-size:0.9rem; cursor:pointer;" onclick="window.location.href='mygame.html'">Primitive version</button></div>
+  </div>
+  <div id="div1">
+    <div id="onScreenButtons" style="z-index:10;"></div>
+  </div>
+  <script type="importmap">
+      {
+          "imports": {
+          "three": "../libs/Three/build/three.module.js"
+          }
+      }
+  </script>
+  <script src="mygamefull.js" type="module" defer></script>
+  <footer id="pageFooter" style="position:fixed; left:0; right:0; bottom:0; background:rgba(0,0,0,0.65); color:#fff; padding:8px 6px; text-align:center; font-size:0.9rem;">
+    <div id="legend" style="margin-bottom:4px;">
+      <strong>What color signifies what behavior:</strong>
+      <span style="display:inline-block;margin-left:12px;color:#cc0000">Red: none</span>
+      <span style="display:inline-block;margin-left:8px;color:#00aa00">Green: align</span>
+      <span style="display:inline-block;margin-left:8px;color:#aa55ff">Purple: separate</span>
+      <span style="display:inline-block;margin-left:8px;color:#ffff55">Yellow: cohere</span>
+    </div>
+    <div id="note"><strong>Note:</strong> All pirates have a global weight toward the player.</div>
+    <div id="controls"><strong>Controls:</strong> W: Forward, S: Backwards, A: Left, D: Right, E: Lazer Eyes, Space: Jump/Swim</div>
+  </footer>
+</body>
+
+</html>
