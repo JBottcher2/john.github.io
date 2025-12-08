@@ -10,8 +10,11 @@
 <body>
   <div id="pageHeader" style="padding:8px; text-align:center;">
     <h1 style="margin:0; font-size:1.2rem;">Alien Pirate — Group ID: 8821</h1>
-    <!-- Link to Full version -->
-    <div style="margin-top:6px;"><button id="toFullBtn" style="padding:6px 10px; font-size:0.9rem; cursor:pointer;" onclick="window.location.href='mygamefull.html'">Full version</button></div>
+    <!-- Link to Full version and info toggle -->
+    <div style="margin-top:6px; display:flex; justify-content:center; gap:8px;">
+      <button id="toFullBtn" style="padding:6px 10px; font-size:0.9rem; cursor:pointer;" onclick="window.location.href='mygamefull.html'">Full version</button>
+      <button id="footerToggle" style="padding:6px 10px; font-size:0.9rem; cursor:pointer;" aria-pressed="false">Hide Info</button>
+    </div>
   </div>
   <div id="div1">
     <div id="onScreenButtons" style="z-index:10;"></div>
@@ -24,6 +27,29 @@
       }
   </script>
   <script src="mygame.js" type="module" defer></script>
+  <script>
+    // Toggle for showing/hiding the footer panel
+    document.addEventListener('DOMContentLoaded', () => {
+      const toggleBtn = document.getElementById('footerToggle');
+      const footer = document.getElementById('pageFooter');
+      if (!toggleBtn || !footer) return;
+
+      let isHidden = false;
+
+      const applyState = () => {
+        footer.style.display = isHidden ? 'none' : 'block';
+        toggleBtn.textContent = isHidden ? 'Show Info' : 'Hide Info';
+        toggleBtn.setAttribute('aria-pressed', isHidden ? 'true' : 'false');
+      };
+
+      toggleBtn.addEventListener('click', () => {
+        isHidden = !isHidden;
+        applyState();
+      });
+
+      applyState();
+    });
+  </script>
   <footer id="pageFooter" style="position:fixed; left:0; right:0; bottom:0; background:rgba(0,0,0,0.65); color:#fff; padding:8px 6px; text-align:center; font-size:0.9rem;">
     <div id="legend" style="margin-bottom:4px;">
       <strong>What color signifies what behavior:</strong>
@@ -32,8 +58,11 @@
       <span style="display:inline-block;margin-left:8px;color:#aa55ff">Purple: separate</span>
       <span style="display:inline-block;margin-left:8px;color:#ffff55;color-adjust: exact;">Yellow: cohere</span>
     </div>
-    <div id="note"><strong>Note:</strong> All pirates have a global weight toward the player.</div>
-    <div id="controls"><strong>Controls:</strong> W: Forward, S: Backwards, A: Left, D: Right, E: Lazer Eyes, Space: Jump/Swim</div>
+    <div id="weightnote"><strong>Note: </strong>All pirates have a global weight toward the player</div>
+    <div id="speednote"><strong>and will slowly speed up the longer they've been alive.</div>
+    <div id="controls"><strong>Controls: </strong>W: Forward, S: Backwards, A: Left, D: Right, E: Lazer Eyes, Space: Jump/Swim</div>
+    <div id="weightnote"><strong>Note: </strong>Lazer eyes have a 2 second cooldown and 5 ammo. Refill by grabbing chests.</div>
+    <div id="rules"><strong>Points: </strong>Kills: 5, Gold: 10, Diamonds: 30, Chests: 100.</div>
   </footer>
 </body>
 
